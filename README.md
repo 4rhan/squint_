@@ -26,10 +26,14 @@ Pytorch Implementation for [[Squint: Fast Visual Reinforcement Learning for Sim-
 If you use this code in your research, kindly cite:
 
 ```bibtex
-@misc{squint2026,
-  title = {Squint: Fast Visual Reinforcement Learning for Sim-to-Real Robotics},
-  year = {2026},
-  url = {https://aalmuzairee.github.io/squint}
+@misc{almuzairee2026squint,
+      title={Squint: Fast Visual Reinforcement Learning for Sim-to-Real Robotics}, 
+      author={Abdulaziz Almuzairee and Henrik I. Christensen},
+      year={2026},
+      eprint={2602.21203},
+      archivePrefix={arXiv},
+      primaryClass={cs.RO},
+      url={https://arxiv.org/abs/2602.21203}, 
 }
 ```
 

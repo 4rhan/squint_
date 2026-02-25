@@ -16,24 +16,21 @@
 
 Squint is a visual Soft Actor Critic method, that through careful image preprocessing, architectural design choices, and hyperparameter selection, is able to leverage parallel environments and experience reuse effectively, achieving faster wall-clock training time than both prior visual off-policy and on-policy methods, and *solving visual tasks in minutes*.
 
-Pytorch Implementation for [[Squint: Fast Visual Reinforcement Learning for Sim-to-Real Robotics]]() by
+Pytorch Implementation for [[Squint: Fast Visual Reinforcement Learning for Sim-to-Real Robotics]](https://arxiv.org/abs/2602.21203) by
 
 [Abdulaziz Almuzairee](https://aalmuzairee.github.io) and [Henrik I. Christensen](https://hichristensen.com) (UC San Diego)</br>
 
 
-[[Website]](https://aalmuzairee.github.io/squint) [[Paper]]() 
+[[Website]](https://aalmuzairee.github.io/squint) [[Paper]](https://arxiv.org/abs/2602.21203) 
 
 If you use this code in your research, kindly cite:
 
 ```bibtex
-@misc{almuzairee2026squint,
+@article{almuzairee2026squint,
       title={Squint: Fast Visual Reinforcement Learning for Sim-to-Real Robotics}, 
-      author={Abdulaziz Almuzairee and Henrik I. Christensen},
-      year={2026},
-      eprint={2602.21203},
-      archivePrefix={arXiv},
-      primaryClass={cs.RO},
-      url={https://arxiv.org/abs/2602.21203}, 
+      author={Almuzairee, Abdulaziz and Christensen, Henrik I.},
+      journal={arXiv preprint arXiv:2602.21203},
+      year={2026}
 }
 ```
 

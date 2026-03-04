@@ -179,8 +179,8 @@ def setup_safe_exit(sim_env, real_env, real_agent, recorder=None):
 
 def overlay_envs(sim_env, real_env):
     """Overlay sim and real observations for visual debugging."""
-    real_obs = real_env.get_obs()["sensor_data"]
-    sim_obs = sim_env.get_obs()["sensor_data"]
+    real_obs = real_env.unwrapped.get_obs()["sensor_data"]
+    sim_obs = sim_env.unwrapped.get_obs()["sensor_data"]
 
     assert sorted(real_obs.keys()) == sorted(sim_obs.keys()), \
         f"Camera mismatch: real={real_obs.keys()}, sim={sim_obs.keys()}"

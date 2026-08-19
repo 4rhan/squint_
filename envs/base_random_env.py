@@ -230,10 +230,11 @@ class BaseRandomEnv(BaseEnv):
 
         stiffnesses = self._batched_episode_rng[env_idx].uniform(stiff_lo, stiff_hi)
         dampings = self._batched_episode_rng[env_idx].uniform(damp_lo, damp_hi)
-        gripper_joint = self.agent.robot.joints_map["gripper"]
+        gripper_joints = [self.agent.robot.joints_map[name] for name in self.agent.gripper_joint_names]
 
         for i, idx in enumerate(env_idx.tolist()):
-            gripper_joint._objs[idx].set_drive_properties(stiffnesses[i], dampings[i], force_limit=100)
+            for gripper_joint in gripper_joints:
+                gripper_joint._objs[idx].set_drive_properties(stiffnesses[i], dampings[i], force_limit=100)
             self._gripper_stiffness[idx] = stiffnesses[i]
             self._gripper_damping[idx] = dampings[i]
 
@@ -532,7 +533,10 @@ class WristCameraEnv(BaseRandomEnv):
     def _update_wrist_camera_pose(self):
         """Update wrist camera mount to follow gripper with random offsets."""
         config = self.domain_randomization_config
-        gripper_pose = self.agent.robot.links_map["gripper_link"].pose
+        if "panda_hand" in self.agent.robot.links_map:
+            gripper_pose = self.agent.robot.links_map["panda_hand"].pose
+        else:
+            gripper_pose = self.agent.robot.links_map["gripper_link"].pose
 
         base_x, base_y, base_z = self.WRIST_CAMERA_BASE_POS
         base_roll, base_pitch, base_yaw = self.WRIST_CAMERA_BASE_ROT_RAD

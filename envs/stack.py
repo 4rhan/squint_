@@ -421,6 +421,57 @@ class Stack(DefaultCameraEnv):
                 )
         return obs
 
+    def get_privileged_state(self) -> torch.Tensor:
+        """Exact object/gripper state, for asymmetric (privileged) critic training.
+
+        Not available on the real robot -- only ever fed to the critic and to the auxiliary
+        prediction head, never to the actor.
+
+        Contents are deliberately the quantities `compute_dense_reward` and `evaluate` branch on,
+        since those are what make Q learnable: the stacking goal offset (which depends on the
+        per-episode randomized item sizes, invisible from a 16x16 wrist image), itemA's velocity,
+        the item dimensions themselves, and the stage indicator booleans.
+        """
+        tcp_pos = self.agent.tcp_pos
+        itemA_pos = self.itemA.pose.p
+        itemB_pos = self.itemB.pose.p
+        offset = itemA_pos - itemB_pos
+
+        # Exact stacking target -- mirrors compute_dense_reward's goal_xyz
+        expected_z_offset = self.itemA_half_sizes + self.itemB_half_sizes
+        goal_xyz = torch.cat(
+            [itemB_pos[:, :2], (itemB_pos[:, 2] + expected_z_offset).unsqueeze(1)], dim=1
+        )
+
+        itemA_vel = self.itemA.linear_velocity
+        xy_dist = torch.linalg.norm(offset[:, :2], dim=1)
+        z_dist = torch.abs(offset[:, 2] - expected_z_offset)
+
+        # Reward/success stage indicators (same expressions as evaluate())
+        flags = torch.stack([
+            self.agent.is_grasping(self.itemA),
+            (xy_dist <= 0.02) & (z_dist <= 0.01),                       # is_itemA_on_itemB
+            itemA_pos[:, 2] >= (self.itemA_half_sizes + 1e-3),          # is_itemA_lifted
+            torch.linalg.norm(itemA_vel, dim=-1) <= 2e-2,               # is_itemA_static
+            self.agent.is_static(),                                     # is_robot_static
+            self.agent.is_touching(self.itemA),                         # robot_touching_itemA
+            self.agent.is_touching(self.table_scene.table),             # robot_touching_table
+        ], dim=-1).float()
+
+        return torch.cat([
+            self.agent.tcp_pose.raw_pose,   # 7
+            self.itemA.pose.raw_pose,       # 7
+            self.itemB.pose.raw_pose,       # 7
+            itemA_pos - tcp_pos,            # 3  tcp_to_itemA_pos
+            itemB_pos - tcp_pos,            # 3  tcp_to_itemB_pos
+            itemB_pos - itemA_pos,          # 3  itemA_to_itemB_pos
+            goal_xyz - itemA_pos,           # 3  itemA_to_goal_pos
+            itemA_vel,                      # 3
+            self.itemA_dimensions,          # 3
+            self.itemB_dimensions,          # 3
+            flags,                          # 7
+        ], dim=-1)                          # -> 49
+
     def evaluate(self):
         posA = self.itemA.pose.p
         posB = self.itemB.pose.p

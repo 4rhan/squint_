@@ -110,6 +110,39 @@ class Args:
     """square size of the input image for actor (HxW) - after downsampling"""
     apply_jitter: bool = True
     """applies color jitter to all input RGB observations (better for sim2real)"""
+    asymmetric_critic: bool = False
+    """gives the critic (only) extra privileged state (exact object/gripper pose, item dimensions,
+    goal offset, contact/stage booleans) concatenated onto its existing image+proprio+action input.
+    The actor is completely unaffected (image+proprio only), since it must still work camera-only on
+    the real robot. Requires the env to implement get_privileged_state() (currently: Stack tasks).
+    Recommended together with --privileged_aux_loss, see its docstring for why."""
+    privileged_aux_loss: bool = False
+    """adds an auxiliary head predicting the privileged state from the shared CNN encoder features
+    + proprio, with its loss added to the critic/encoder loss. This is Pinto et al.'s "bottleneck"
+    auxiliary task, moved to the encoder because in Squint the encoder is trained by critic
+    gradients only. It matters for two reasons: (1) once the critic is handed the privileged state
+    it can explain Q without the image, which starves the encoder -- and hence the actor -- of
+    gradient; (2) it is what actually pushes privileged information into the representation the
+    actor consumes. Usable with or without --asymmetric_critic. The actor still only ever sees
+    image + proprio, at train and deploy time."""
+    privileged_aux_coef: float = 1.0
+    """weight on the --privileged_aux_loss term"""
+    critic_blind: bool = False
+    """if toggled, the critic sees ONLY proprio + privileged state, with no image features at all.
+
+    This is the exact asymmetric actor-critic of Pinto et al. (2017). In Squint it is expected to
+    fail by construction: the CNN encoder is trained by critic gradients alone (the actor consumes
+    stop-gradient features), so a critic that never consumes image features leaves the encoder at
+    its initialisation and the actor reads untrained visual representations. Requires
+    --asymmetric_critic. Ablation only -- never for deployment."""
+    aug_random_shift: bool = False
+    """applies DrQ-style random shift augmentation (replicate-pad + independent random crop per
+    sample) to the encoder's image input at update time. Since actor and critic share one encoder,
+    this augments both."""
+    aug_random_shift_pad: int = 1
+    """replicate-padding size in pixels (of the stored image_size x image_size buffer image) used by
+    --aug_random_shift. DrQ-v2 uses 4px on 84x84 (~5%); 1px on Squint's 16x16 is the equivalent
+    relative shift -- 4px here would displace a quarter of the image."""
 
     # Algorithm specific arguments
     total_timesteps: int = 1_500_000
@@ -219,6 +252,28 @@ def weight_init(m):
             m.bias.data.fill_(0.0)
 
 
+def random_shift_aug(x: torch.Tensor, pad: int) -> torch.Tensor:
+    """DrQ-style random shift augmentation (Yarats et al., DrQ-v2): replicate-pads the image then
+    takes an independent random crop per sample (via grid_sample) back to the original size.
+    Input/output: (B, H, W, C)."""
+    x = x.permute(0, 3, 1, 2).float()
+    b, c, h, w = x.shape
+    assert h == w, "random_shift_aug expects square images"
+    x = F.pad(x, (pad, pad, pad, pad), mode='replicate')
+    eps = 1.0 / (h + 2 * pad)
+    arange = torch.linspace(-1.0 + eps, 1.0 - eps, h + 2 * pad, device=x.device, dtype=x.dtype)[:h]
+    arange = arange.unsqueeze(0).repeat(h, 1).unsqueeze(2)
+    base_grid = torch.cat([arange, arange.transpose(1, 0)], dim=2)
+    base_grid = base_grid.unsqueeze(0).repeat(b, 1, 1, 1)
+
+    shift = torch.randint(0, 2 * pad + 1, size=(b, 1, 1, 2), device=x.device, dtype=x.dtype)
+    shift *= 2.0 / (h + 2 * pad)
+
+    grid = base_grid + shift
+    x = F.grid_sample(x, grid, padding_mode='zeros', align_corners=False)
+    return x.permute(0, 2, 3, 1)
+
+
 class CNNEncoder(nn.Module):
     def __init__(self, n_obs, device=None):
         super().__init__()
@@ -261,18 +316,46 @@ class CNNEncoder(nn.Module):
 
 
 class Projection(nn.Module):
-    def __init__(self, n_obs, n_state, device=None):
+    def __init__(self, n_obs, n_state, blind=False, device=None):
         super().__init__()
-        self.repr_dim = 50 + 256
-        self.rgb_proj = nn.Sequential(
-            nn.Linear(n_obs, 50, device=device), nn.LayerNorm(50, device=device), nn.Tanh(),
-        )
+        # blind=True drops the image pathway entirely (see Args.critic_blind). rgb_proj is not
+        # constructed at all, so no unused parameters ever reach the optimizer.
+        self.blind = blind
+        self.repr_dim = (0 if blind else 50) + 256
+        if not blind:
+            self.rgb_proj = nn.Sequential(
+                nn.Linear(n_obs, 50, device=device), nn.LayerNorm(50, device=device), nn.Tanh(),
+            )
         self.state_proj = nn.Sequential(
             nn.Linear(n_state, 256, device=device), nn.LayerNorm(256, device=device), nn.ReLU(),
         )
 
     def forward(self, rgb, state):
+        if self.blind:
+            return self.state_proj(state)
         return torch.cat([self.rgb_proj(rgb), self.state_proj(state)], dim=-1)
+
+
+class PrivilegedPredictor(nn.Module):
+    """Auxiliary head predicting the privileged state from encoder features + proprio.
+
+    Adapted from the bottleneck auxiliary task of Pinto et al. (Asymmetric Actor Critic, Sec. IV-B),
+    which puts an L2 full-state prediction loss on an intermediate actor layer. Squint's actor reads
+    stop-gradient encoder features, so the equivalent placement here is the shared encoder -- which
+    the critic optimizer already owns. Proprio is an input because world-frame object poses are only
+    recoverable from a *wrist* image once the arm configuration is known.
+    """
+    def __init__(self, n_obs, n_state, n_privileged, hidden_dim=256, device=None):
+        super().__init__()
+        self.fc = nn.Sequential(
+            nn.Linear(n_obs + n_state, hidden_dim, device=device),
+            nn.LayerNorm(hidden_dim, device=device), nn.ReLU(),
+            nn.Linear(hidden_dim, n_privileged, device=device),
+        )
+        self.apply(weight_init)
+
+    def forward(self, rgb_features, state):
+        return self.fc(torch.cat([rgb_features, state], dim=-1))
 
 
 class Actor(nn.Module):
@@ -333,18 +416,28 @@ class Actor(nn.Module):
 
 class Critic(nn.Module):
     """Distributional C51 Ensemble-Q-network critic with vmap optimizations."""
-    def __init__(self, n_obs, n_state, n_act, num_atoms, v_min, v_max, num_q=2, device=None):
+    def __init__(self, n_obs, n_state, n_act, num_atoms, v_min, v_max, num_q=2, n_privileged=0, blind=False, device=None):
         super().__init__()
         self.num_atoms = num_atoms
         self.num_q = num_q
         self.v_min = v_min
         self.v_max = v_max
+        self.n_privileged = n_privileged
         self.q_support = torch.linspace(v_min, v_max, num_atoms, device=device)
 
-        self.proj = Projection(n_obs, n_state, device=device)
+        self.blind = blind
+        self.proj = Projection(n_obs, n_state, blind=blind, device=device)
         self.proj.apply(weight_init)
 
-        q_input_dim = self.proj.repr_dim + n_act
+        critic_repr_dim = self.proj.repr_dim
+        if n_privileged > 0:
+            self.privileged_proj = nn.Sequential(
+                nn.Linear(n_privileged, 64, device=device), nn.LayerNorm(64, device=device), nn.ReLU(),
+            )
+            self.privileged_proj.apply(weight_init)
+            critic_repr_dim += 64
+
+        q_input_dim = critic_repr_dim + n_act
 
         # Build Q-networks, apply weight init, then stack into q_params
         q_nets = [self._build_q_network(q_input_dim, num_atoms, device=device) for _ in range(num_q)]
@@ -364,6 +457,8 @@ class Critic(nn.Module):
         """Pretty module printing"""
         lines = [f"{self.__class__.__name__}("]
         lines.append(f"  (proj): {self.proj}")
+        if self.n_privileged > 0:
+            lines.append(f"  (privileged_proj): {self.privileged_proj}")
         for i in range(self.num_q):
             lines.append(f"  (q{i}): {self._q_repr}")
         lines.append(")")
@@ -384,13 +479,19 @@ class Critic(nn.Module):
         with params.to_module(self._q_meta):
             return self._q_meta(x)
 
-    def forward(self, rgb_features, state, actions):
-        """Batched forward: [num_q, batch, num_atoms]. Full gradient flow through all params."""
+    def _proj_features(self, rgb_features, state, privileged=None):
         proj = self.proj(rgb_features, state)
+        if self.n_privileged > 0:
+            proj = torch.cat([proj, self.privileged_proj(privileged)], dim=-1)
+        return proj
+
+    def forward(self, rgb_features, state, actions, privileged=None):
+        """Batched forward: [num_q, batch, num_atoms]. Full gradient flow through all params."""
+        proj = self._proj_features(rgb_features, state, privileged)
         x = torch.cat([proj, actions], dim=-1)
         return torch.vmap(self._vmap_q, (0, None))(self.q_params, x)
 
-    def get_q_values(self, rgb_features, state, actions, detach_critic=False):
+    def get_q_values(self, rgb_features, state, actions, privileged=None, detach_critic=False):
         """Expected Q-values: [num_q, batch].
 
         Args:
@@ -399,15 +500,15 @@ class Critic(nn.Module):
         """
         if detach_critic:
             with torch.no_grad():
-                proj = self.proj(rgb_features, state) 
+                proj = self._proj_features(rgb_features, state, privileged)
             x = torch.cat([proj, actions], dim=-1)
             logits = torch.vmap(self._vmap_q, (0, None))(self.q_params.data, x)
         else:
-            logits = self.forward(rgb_features, state, actions)
+            logits = self.forward(rgb_features, state, actions, privileged)
         probs = F.softmax(logits, dim=-1)
         return torch.sum(probs * self.q_support, dim=-1)
 
-    def categorical(self, rgb_features, state, actions, rewards, bootstrap, discount):
+    def categorical(self, rgb_features, state, actions, rewards, bootstrap, discount, privileged=None):
         """C51 categorical projection: [num_q, batch, num_atoms].
         Called under no_grad for target computation."""
         delta_z = (self.v_max - self.v_min) / (self.num_atoms - 1)
@@ -426,7 +527,7 @@ class Critic(nn.Module):
         upper = torch.where(torch.logical_and(lower == 0, is_integer), upper + 1, upper)
 
         # Batched forward through all Q-networks via vmap
-        logits = self.forward(rgb_features, state, actions)  # [num_q, batch, atoms]
+        logits = self.forward(rgb_features, state, actions, privileged)  # [num_q, batch, atoms]
         next_dists = F.softmax(logits, dim=-1)
 
         # Fused projection: reshape to [num_q*batch, atoms]
@@ -596,6 +697,16 @@ if __name__ == "__main__":
     envs = FlattenRGBDObservationWrapper(envs, rgb=True, depth=False, state=True)
     eval_envs = FlattenRGBDObservationWrapper(eval_envs, rgb=True, depth=False, state=True)
 
+    # Privileged state is a training-time-only signal for the critic and/or the auxiliary head --
+    # only wrap the training envs, never eval_envs, since evaluation only ever calls the actor
+    # (image + proprio), exactly as on the real robot.
+    if args.critic_blind and not args.asymmetric_critic:
+        raise ValueError("--critic_blind requires --asymmetric_critic: a critic with neither image "
+                         "features nor privileged state would see only proprioception.")
+    use_privileged = args.asymmetric_critic or args.privileged_aux_loss
+    if use_privileged:
+        envs = utils.PrivilegedObsWrapper(envs)
+
     if args.render_size != args.image_size:
         envs = utils.DownsampleObsWrapper(envs, target_size=args.image_size)
         eval_envs = utils.DownsampleObsWrapper(eval_envs, target_size=args.image_size)
@@ -627,6 +738,7 @@ if __name__ == "__main__":
     n_channels = envs.unwrapped.single_observation_space['rgb'].shape[2]
     n_obs = (args.image_size, args.image_size, n_channels)
     n_state = math.prod(envs.unwrapped.single_observation_space['state'].shape)
+    n_privileged = envs.unwrapped.get_privileged_state().shape[-1] if use_privileged else 0
     assert isinstance(envs.unwrapped.single_action_space, gym.spaces.Box), "only continuous action space is supported"
 
     # ── Logger ─────────────────────────────────────────────────────────────
@@ -647,11 +759,19 @@ if __name__ == "__main__":
 
     # ── Instantiate modules ────────────────────────────────────────────────
 
+    # The critic only *consumes* the privileged state under --asymmetric_critic; --privileged_aux_loss
+    # alone routes it to the auxiliary head only, leaving the critic architecture untouched.
+    n_critic_privileged = n_privileged if args.asymmetric_critic else 0
+
     encoder = CNNEncoder(n_obs=n_obs, device=device)
     actor = Actor(envs, n_obs=encoder.repr_dim, n_state=n_state, n_act=n_act, device=device)
     critic = Critic(n_obs=encoder.repr_dim, n_state=n_state, n_act=n_act,
                     num_atoms=args.num_atoms, v_min=args.v_min, v_max=args.v_max,
-                    num_q=args.num_q, device=device)
+                    num_q=args.num_q, n_privileged=n_critic_privileged, blind=args.critic_blind, device=device)
+    privileged_predictor = (
+        PrivilegedPredictor(n_obs=encoder.repr_dim, n_state=n_state, n_privileged=n_privileged, device=device)
+        if args.privileged_aux_loss else None
+    )
 
     # Entropy tuning
     if args.autotune:
@@ -696,7 +816,7 @@ if __name__ == "__main__":
     # Target critic 
     critic_target = Critic(n_obs=encoder.repr_dim, n_state=n_state, n_act=n_act,
                            num_atoms=args.num_atoms, v_min=args.v_min, v_max=args.v_max,
-                           num_q=args.num_q, device=device)
+                           num_q=args.num_q, n_privileged=n_critic_privileged, blind=args.critic_blind, device=device)
     critic_target.load_state_dict(critic.state_dict())
     critic_online_params = list(critic.parameters())
     critic_target_params = list(critic_target.parameters())
@@ -714,7 +834,10 @@ if __name__ == "__main__":
 
     # ── Optimizers ─────────────────────────────────────────────────────────
 
-    critic_optimizer = optim.Adam(list(critic.parameters()) + list(encoder.parameters()),
+    critic_params = list(critic.parameters()) + list(encoder.parameters())
+    if args.privileged_aux_loss:
+        critic_params += list(privileged_predictor.parameters())
+    critic_optimizer = optim.Adam(critic_params,
                              lr=args.q_lr, capturable=args.cudagraphs and not args.compile)
     actor_optimizer = optim.Adam(list(actor.parameters()),
                                  lr=args.policy_lr, capturable=args.cudagraphs and not args.compile)
@@ -723,8 +846,8 @@ if __name__ == "__main__":
 
     # TODO: Buffer stores current and next observations, should only store one
     buffer_mem = utils.calc_buffer_memory(
-        rgb_dim=np.prod(n_obs), 
-        state_dim=n_state, 
+        rgb_dim=np.prod(n_obs),
+        state_dim=n_state + n_privileged,
         action_dim=n_act,
         max_length=min(args.buffer_size, args.total_timesteps), 
         rgb_dtype=np.uint8,
@@ -740,8 +863,14 @@ if __name__ == "__main__":
     print("-----------------------")
     for mod in [encoder, actor, critic]:
         print(mod)
+    if args.privileged_aux_loss:
+        print(privileged_predictor)
     print(f"Task: {args.env_id}, Control mode: {envs.unwrapped._control_mode}")
     print(f"Observations: {n_obs}, State: {n_state}, Actions: {n_act}")
+    if use_privileged:
+        print(f"Privileged (training-only, never seen by the actor): {n_privileged} "
+              f"[critic: {'yes' if args.asymmetric_critic else 'no'}, "
+              f"aux head: {'yes' if args.privileged_aux_loss else 'no'}]")
     print(f"Buffer memory required: {buffer_mem:.2f} GB")
     print(f"Device: {device}")
     print("-----------------------")
@@ -751,7 +880,10 @@ if __name__ == "__main__":
     def update_main(data):
         with torch.amp.autocast('cuda', dtype=torch.bfloat16):
             with torch.no_grad():
-                next_obs = encoder(data["next_observations"]['rgb'])
+                next_rgb = data["next_observations"]['rgb']
+                if args.aug_random_shift:
+                    next_rgb = random_shift_aug(next_rgb, args.aug_random_shift_pad)
+                next_obs = encoder(next_rgb)
                 next_state = data["next_observations"]['state']
                 next_state_actions, next_state_log_pi, _ = actor.get_action(next_obs, next_state)
 
@@ -762,23 +894,48 @@ if __name__ == "__main__":
                 entropy_bonus = alpha * next_state_log_pi.flatten()
                 rewards_with_entropy = rewards - bootstrap.flatten() * discount * entropy_bonus
 
+                next_privileged = data["next_observations"]["privileged_state"] if use_privileged else None
                 target_distributions = critic_target.categorical(
                     next_obs, next_state, next_state_actions,
-                    rewards_with_entropy, bootstrap, discount
+                    rewards_with_entropy, bootstrap, discount, privileged=next_privileged
                 )
 
-            obs = encoder(data["observations"]['rgb'])
+            rgb = data["observations"]['rgb']
+            if args.aug_random_shift:
+                rgb = random_shift_aug(rgb, args.aug_random_shift_pad)
+            obs = encoder(rgb)
             state = data["observations"]['state']
+            privileged = data["observations"]["privileged_state"] if use_privileged else None
 
             # Shape: [num_q, batch, num_atoms]
-            q_outputs = critic(obs, state, data["actions"])
+            q_outputs = critic(obs, state, data["actions"], privileged=privileged)
             q_log_probs = F.log_softmax(q_outputs, dim=-1)
 
             # Cross-entropy: sum over num_atoms, mean over batch → [num_q]
             q_losses = -torch.sum(target_distributions * q_log_probs, dim=-1).mean(dim=-1)
-            
+
             # Sum over Q-networks losses
             critic_loss = q_losses.sum()
+
+            if args.critic_blind:
+                # The blind critic never consumes `obs`, so the encoder receives no gradient --
+                # which is precisely what this ablation tests. This term is identically zero and
+                # contributes identically zero gradient; it exists only so that encoder .grad
+                # tensors are allocated, keeping the compiled/captured optimizer step
+                # structurally identical to the other arms. Mathematically a no-op.
+                critic_loss = critic_loss + 0.0 * obs.sum()
+
+            # Auxiliary privileged-state prediction on the shared encoder features
+            if args.privileged_aux_loss:
+                priv_pred = privileged_predictor(obs, state)
+                # Per-dimension standardisation over the minibatch: the privileged vector mixes
+                # metres, quaternions and booleans, so a raw MSE would be dominated by the latter
+                # two. Floored so near-constant dimensions can't blow the weight up.
+                priv_scale = privileged.std(dim=0, keepdim=True).clamp(min=0.05).detach()
+                aux_loss = F.mse_loss(priv_pred / priv_scale, privileged / priv_scale)
+                critic_loss = critic_loss + args.privileged_aux_coef * aux_loss
+            else:
+                aux_loss = torch.zeros((), device=device)
 
             # Logging q-value metrics
             with torch.no_grad():
@@ -808,16 +965,18 @@ if __name__ == "__main__":
             alpha_loss = torch.tensor(0.0, device=device)
 
         return TensorDict(critic_loss=critic_loss.detach(), q_max=q_max, q_min=q_min,
-                          alpha=alpha.detach(), alpha_loss=alpha_loss.detach(), 
+                          alpha=alpha.detach(), alpha_loss=alpha_loss.detach(),
+                          privileged_aux_loss=aux_loss.detach(),
                           encoded_rgb=obs.detach())
 
     def update_actor(data, encoded_rgb):
         with torch.amp.autocast('cuda', dtype=torch.bfloat16):
             state = data["observations"]["state"]
             obs = encoded_rgb
+            privileged = data["observations"]["privileged_state"] if use_privileged else None
 
             pi, log_pi, _ = actor.get_action(obs, state)
-            q_values = critic.get_q_values(obs, state, pi, detach_critic=True)
+            q_values = critic.get_q_values(obs, state, pi, privileged=privileged, detach_critic=True)
             
             # Mean (No CDQ)
             critic_value = q_values.mean(dim=0) 
@@ -880,6 +1039,8 @@ if __name__ == "__main__":
 
         next_obs, rewards, terminations, truncations, infos = envs.step(actions)
         real_next_obs = {'rgb': next_obs['rgb'].clone(), 'state': next_obs['state'].clone()}
+        if use_privileged:
+            real_next_obs['privileged_state'] = next_obs['privileged_state'].clone()
 
         # Determine bootstrap behavior 
         if args.bootstrap_at_done == 'never':
@@ -895,6 +1056,8 @@ if __name__ == "__main__":
         if "final_info" in infos:
             real_next_obs['rgb'][need_final_obs] = infos["final_observation"]['rgb'][need_final_obs]
             real_next_obs['state'][need_final_obs] = infos["final_observation"]['state'][need_final_obs]
+            if use_privileged:
+                real_next_obs['privileged_state'][need_final_obs] = infos["final_observation"]['privileged_state'][need_final_obs]
 
         transition = TensorDict(
             observations=obs,

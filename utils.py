@@ -80,6 +80,33 @@ class ColorJitterWrapper(gym.ObservationWrapper):
         return obs
 
 
+class PrivilegedObsWrapper(gym.ObservationWrapper):
+    """Adds exact object/gripper state as obs['privileged_state'].
+
+    Training-time only (--asymmetric_critic / --privileged_aux_loss) -- this key must never reach
+    the actor, since it is unavailable on the real robot. It is kept as a sibling key rather than
+    routed through _get_obs_extra precisely because FlattenRGBDObservationWrapper would otherwise
+    merge it into the flat 'state' tensor that the actor reads. Requires the wrapped env to
+    implement get_privileged_state() (see envs/stack.py). Apply after FlattenRGBDObservationWrapper.
+    """
+    def __init__(self, env):
+        super().__init__(env)
+        self.base_env = env.unwrapped
+        if not hasattr(self.base_env, "get_privileged_state"):
+            raise NotImplementedError(
+                f"{type(self.base_env).__name__} does not implement get_privileged_state(); "
+                "--asymmetric_critic is only supported for envs that expose it (currently: Stack tasks)."
+            )
+        dim = self.base_env.get_privileged_state().shape[-1]
+        self.observation_space['privileged_state'] = gym.spaces.Box(
+            low=-np.inf, high=np.inf, shape=(dim,), dtype=np.float32
+        )
+
+    def observation(self, obs):
+        obs['privileged_state'] = self.base_env.get_privileged_state()
+        return obs
+
+
 # ---------------------------  Extra Utils --------------------------------------#
 
 def calc_buffer_memory(rgb_dim, state_dim, action_dim, max_length, rgb_dtype=np.uint8, store_next_obs=True):

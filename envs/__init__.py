@@ -9,3 +9,4 @@ import envs.lift
 import envs.place
 import envs.stack
 import envs.peg_insertion
+import envs.tool_use

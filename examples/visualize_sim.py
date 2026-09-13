@@ -33,14 +33,12 @@ import mani_skill.envs
 CONFIG = {
     # Tasks to visualize
     'tasks': [
-        'SO101ReachCube-v1', 'SO101ReachCan-v1',
-        'SO101LiftCube-v1', 'SO101LiftCan-v1',
-        'SO101PlaceCube-v1', 'SO101PlaceCan-v1',
-        'SO101StackCube-v1', 'SO101StackCan-v1',
+        
+        'SO101ToolSweep-v1'
     ],
 
     # Environment settings
-    'num_envs': 16,
+    'num_envs': 1,
     'seed': 1,
     'obs_mode': 'rgb+segmentation', # For Wrist Camera View
     'render_mode': 'rgb_array',
@@ -74,6 +72,7 @@ def make_env(task: str, config: dict = CONFIG):
         num_envs=config['num_envs'],
         domain_randomization=config['domain_randomization'],
         reconfiguration_freq=None,
+        sim_backend='cpu'
     )
 
     if config['control_mode'] is not None:

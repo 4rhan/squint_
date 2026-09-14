@@ -178,7 +178,11 @@ def evaluate(args, eval_envs, get_action_fn, logger, eval_output_dir, max_episod
     eval_metrics = defaultdict(list)
 
     # Mirror the training rollout: query the policy once per h-step chunk, execute it open-loop.
-    num_decision_steps = max_episode_steps // args.chunk_size
+    # Use ceil so every env still reaches its actual truncation horizon even when max_episode_steps
+    # isn't evenly divisible by chunk_size (running a couple extra steps into the next episode is
+    # harmless -- envs auto-reset on truncation -- but undershooting means no episode ever truncates
+    # during eval, leaving eval_metrics empty).
+    num_decision_steps = math.ceil(max_episode_steps / args.chunk_size)
     for _ in range(num_decision_steps):
         with torch.no_grad():
             flat_chunk = get_action_fn(eval_obs['rgb'], eval_obs['state'])

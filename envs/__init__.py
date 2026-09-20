@@ -8,3 +8,4 @@ import envs.reach
 import envs.lift
 import envs.place
 import envs.stack
+import envs.stack3

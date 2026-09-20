@@ -37,6 +37,7 @@ CONFIG = {
         'SO101LiftCube-v1', 'SO101LiftCan-v1',
         'SO101PlaceCube-v1', 'SO101PlaceCan-v1',
         'SO101StackCube-v1', 'SO101StackCan-v1',
+        'SO101Stack3Cube-v1',
     ],
 
     # Environment settings

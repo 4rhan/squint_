@@ -172,10 +172,22 @@ def evaluate(args, eval_envs, get_action_fn, logger, eval_output_dir, max_episod
     eval_obs, _ = eval_envs.reset()
     eval_metrics = defaultdict(list)
 
+    # Track task-specific sub-goal flags across the eval rollout (present only on some tasks,
+    # e.g. SO101Stack3Cube-v1's is_itemB_on_itemC / is_itemA_grasped / is_itemA_on_itemB), so we
+    # can see *where* in a multi-stage task the policy gets stuck during training, not just final
+    # success. Eval envs run ignore_terminations=True by default so the whole batch stays on the
+    # same episode for this entire loop, making a plain OR-accumulation safe here.
+    stage_flag_keys = ["is_itemB_on_itemC", "is_itemA_grasped", "is_itemA_on_itemB"]
+    stage_once = {}
+
     for _ in range(max_episode_steps):
         with torch.no_grad():
             eval_action = get_action_fn(eval_obs['rgb'], eval_obs['state'])
             eval_obs, _, _, _, eval_infos = eval_envs.step(eval_action)
+            for key in stage_flag_keys:
+                if key in eval_infos:
+                    stage_once.setdefault(key, torch.zeros_like(eval_infos[key]))
+                    stage_once[key] |= eval_infos[key]
             if "final_info" in eval_infos:
                 mask = eval_infos["_final_info"]
                 for k, v in eval_infos["final_info"]["episode"].items():
@@ -184,12 +196,17 @@ def evaluate(args, eval_envs, get_action_fn, logger, eval_output_dir, max_episod
     eval_d = {}
     for k, v in eval_metrics.items():
         eval_d[k] = torch.stack(v).float().mean()
+    for key, flags in stage_once.items():
+        eval_d[f"eval/{key}_once"] = flags.float().mean()
 
-    pbar.set_description(
+    desc = (
         f"success_at_end: {eval_d['eval/success_at_end']:.2f}, "
         f"success_once: {eval_d['eval/success_once']:.2f}, "
         f"return: {eval_d['eval/return']:.2f}"
     )
+    if stage_once:
+        desc += " | " + ", ".join(f"{k}_once: {eval_d[f'eval/{k}_once']:.2f}" for k in stage_once)
+    pbar.set_description(desc)
     eval_time = time.perf_counter() - stime
     eval_d["time/eval_time"] = eval_time
 

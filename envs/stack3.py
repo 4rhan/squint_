@@ -524,10 +524,13 @@ class Stack3(DefaultCameraEnv):
             robot_qvel=robot_qvel,
         )
 
-        # Total reward is monotonic across the task: [0, 9] while building the base,
-        # [9, 18] while placing the top cube once the base is locked in, 20 on success.
+        # Total reward is monotonic across the task, following the exact same scale as
+        # the 2-cube Stack task's own reward (0-8 while reaching/placing, +1 bump when a
+        # cube is locked in on its base) chained twice: [0, 8] building the base, then a flat
+        # +9 once itemB is locked in on itemC, plus [0, 8] for placing itemA on itemB, and
+        # finally a +1 bump over the natural max (17) once the whole tower succeeds -> 18.
         reward = torch.where(stage1_done, 9 + stage2_reward, stage1_reward)
-        reward[info["success"]] = 20
+        reward[info["success"]] = 18
 
         # Penalties
         reward -= 6 * info["robot_touching_table"].float()
@@ -539,7 +542,7 @@ class Stack3(DefaultCameraEnv):
     def compute_normalized_dense_reward(
         self, obs: Any, action: torch.Tensor, info: dict
     ):
-        return self.compute_dense_reward(obs=obs, action=action, info=info) / 20
+        return self.compute_dense_reward(obs=obs, action=action, info=info) / 18
 
 
 @register_env("SO101Stack3Cube-v1", max_episode_steps=100)

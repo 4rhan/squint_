@@ -21,6 +21,7 @@ dependencies:
     - tqdm
     - wandb
     - opencv-python==4.12.0.88
+    - viser
   
     # Deploy 
     - lerobot[feetech]==0.4.3

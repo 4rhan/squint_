@@ -71,8 +71,11 @@ class Stack3(DefaultCameraEnv):
         domain_randomization=False,
         spawn_box_pos=[0.3, 0],
         spawn_box_half_size=0.2 / 2,
+        stage2_start_prob=0.0,
         **kwargs,
     ):
+        self.stage2_start_prob = stage2_start_prob
+
         # Robot-specific configuration
         if robot_uids == "so100":
             self.base_z_rot = np.pi / 2
@@ -286,26 +289,38 @@ class Stack3(DefaultCameraEnv):
             itemB_xy_offset = sampler.sample(itemB_radius, 100, verbose=False)
             itemC_xy_offset = sampler.sample(itemC_radius, 100, verbose=False)
 
-            # Set itemA pose (red, top)
+            # itemA (red, top)
             itemA_xyz = torch.zeros((b, 3))
             itemA_xyz[:, :2] = spawn_center[env_idx, :2] + itemA_xy_offset
             itemA_xyz[:, 2] = self.itemA_half_sizes[env_idx]
-            qs = randomization.random_quaternions(b, lock_x=True, lock_y=True)
-            self.itemA.set_pose(Pose.create_from_pq(itemA_xyz, qs))
+            qsA = randomization.random_quaternions(b, lock_x=True, lock_y=True)
 
-            # Set itemB pose (blue, middle)
+            # itemB (blue, middle)
             itemB_xyz = torch.zeros((b, 3))
             itemB_xyz[:, :2] = spawn_center[env_idx, :2] + itemB_xy_offset
             itemB_xyz[:, 2] = self.itemB_half_sizes[env_idx]
-            qs = randomization.random_quaternions(b, lock_x=True, lock_y=True)
-            self.itemB.set_pose(Pose.create_from_pq(itemB_xyz, qs))
+            qsB = randomization.random_quaternions(b, lock_x=True, lock_y=True)
 
-            # Set itemC pose (green, base)
+            # itemC (green, base)
             itemC_xyz = torch.zeros((b, 3))
             itemC_xyz[:, :2] = spawn_center[env_idx, :2] + itemC_xy_offset
             itemC_xyz[:, 2] = self.itemC_half_sizes[env_idx]
-            qs = randomization.random_quaternions(b, lock_x=True, lock_y=True)
-            self.itemC.set_pose(Pose.create_from_pq(itemC_xyz, qs))
+            qsC = randomization.random_quaternions(b, lock_x=True, lock_y=True)
+
+            # Curriculum: start a fraction of episodes with itemB already resting on itemC, so
+            # the policy sees stage-2 states (grasp/place itemA) from step 0 instead of having to
+            # first finish stage 1 and then stumble into stage 2 by exploration.
+            if self.stage2_start_prob > 0:
+                prestacked = torch.rand(b) < self.stage2_start_prob
+                itemB_xyz[prestacked, :2] = itemC_xyz[prestacked, :2]
+                itemB_xyz[prestacked, 2] = (
+                    2 * self.itemC_half_sizes[env_idx] + self.itemB_half_sizes[env_idx]
+                )[prestacked]
+                qsB[prestacked] = qsC[prestacked]
+
+            self.itemA.set_pose(Pose.create_from_pq(itemA_xyz, qsA))
+            self.itemB.set_pose(Pose.create_from_pq(itemB_xyz, qsB))
+            self.itemC.set_pose(Pose.create_from_pq(itemC_xyz, qsC))
 
             # Goal B is on top of itemC
             goalB_xyz = itemC_xyz.clone()
@@ -545,7 +560,7 @@ class Stack3(DefaultCameraEnv):
         return self.compute_dense_reward(obs=obs, action=action, info=info) / 18
 
 
-@register_env("SO101Stack3Cube-v1", max_episode_steps=100)
+@register_env("SO101Stack3Cube-v1", max_episode_steps=150)
 class Stack3Cube(Stack3):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)

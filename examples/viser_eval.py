@@ -146,7 +146,7 @@ def main(args: Args):
         if "success" in info:
             success_text.value = str(info["success"].tolist())
         stage_bits = []
-        for key in ["is_itemB_on_itemC", "is_itemA_grasped", "is_itemA_on_itemB"]:
+        for key in ["is_itemB_on_itemC", "is_itemA_grasped", "is_itemA_on_itemB", "num_in_bin"]:
             if key in info:
                 stage_bits.append(f"{key}={info[key].tolist()}")
         if stage_bits:

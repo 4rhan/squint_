@@ -1,14 +1,9 @@
 """Collect scripted/motion-planning demonstrations for SO101Place3Cube-v1
-(pick up 3 identical cubes one by one, drop each into a bin).
+(pick up 3 identical cubes one by one and set them in a row in a bin).
 
 Same pipeline as collect_stack_demos.py, pointed at the long-horizon
-pick-place-3 task (envs/place3.py) instead of the 2-cube stack. Note: the
-underlying grasp (SO101ArmMotionPlanningSolver.grasp_axis_remap /
-_tcp_to_movegroup_local_offset in examples/motionplanning/so101/motionplanner.py)
-is shared with collect_stack_demos.py and is NOT yet reliably closing on the
-cube (SO101 is a 5-DOF arm, so the derived 6-DOF grasp orientation is often
-unreachable and plan_screw silently converges off-target) -- fix that there
-first; it will carry over here automatically once solved.
+pick-place-3 task (envs/place3.py). Uses the scripted grasp solver in
+examples/motionplanning/so101/motionplanner.py (no mplib).
 
 Records raw joint-position trajectories (obs_mode="none", control_mode
 "pd_joint_pos") to a ManiSkill .h5/.json trajectory pair. Convert to the
@@ -72,7 +67,7 @@ def main(args):
         trajectory_name=traj_name,
         save_video=args.save_video,
         source_type="motionplanning",
-        source_desc="scripted SO101 place3_cube motion-planning solution",
+        source_desc="scripted SO101 place3_cube solution (IK + joint interpolation)",
         video_fps=30,
         record_reward=False,
         save_on_reset=False,

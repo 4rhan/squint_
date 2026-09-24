@@ -176,11 +176,14 @@ class QCAgent(nn.Module):
         return a.clamp(-1, 1)
 
     @torch.no_grad()
-    def sample_actions(self, rgb, state):
-        """Flattened action chunk [B, h * n_act] in normalised action space."""
+    def sample_actions(self, rgb, state, deterministic=False):
+        """Flattened action chunk [B, h * n_act] in normalised action space. `deterministic` feeds the
+        one-step policy zero noise (the mean of its noise input), for evaluation."""
         B = rgb.shape[0]
         if self.cfg.actor_type == "distill-ddpg":
             noise = torch.randn(B, self.chunk_dim, device=rgb.device)
+            if deterministic:
+                noise.zero_()
             return self.onestep(rgb, state, noise).clamp(-1, 1)
         # best-of-n: draw n flow chunks per obs, keep the one with the highest aggregated Q
         n = self.cfg.actor_num_samples
@@ -193,9 +196,9 @@ class QCAgent(nn.Module):
         return acts.view(B, n, -1)[torch.arange(B, device=q.device), best]
 
     @torch.no_grad()
-    def act(self, rgb, state):
+    def act(self, rgb, state, deterministic=False):
         """Full chunk [B, horizon, n_act] in normalised action space."""
-        return self.sample_actions(rgb, state).view(-1, self.cfg.horizon, self.n_act)
+        return self.sample_actions(rgb, state, deterministic).view(-1, self.cfg.horizon, self.n_act)
 
     # ---------------------------------------------------------------- learning
     def update(self, b, update_actor=True):

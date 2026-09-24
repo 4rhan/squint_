@@ -37,9 +37,11 @@ from train_squint import Args, Logger, evaluate
 class QCArgs(Args):
     agent_name: Optional[str] = "squint_qc"
     exp_name: Optional[str] = "qc_baseline"
-    gamma: float = 0.99
-    """discount (per env step; the h-step backup uses gamma**horizon)"""
-    tau: float = 0.005
+    gamma: float = 0.9
+    """discount per env step (the h-step backup uses gamma**horizon). Squint's tuned value for these
+    50-step dense-reward tasks; the official QC's 0.99 targets long sparse-reward OGBench tasks."""
+    tau: float = 0.01
+    """target smoothing coefficient (Squint's value)"""
     policy_frequency: int = 1
     """unused by QC (actor + critic update together); kept so the base Args stay valid"""
 
@@ -50,11 +52,11 @@ class QCArgs(Args):
     """gradient steps of offline pretraining on the demos before any environment interaction"""
     offline_ratio: float = 0.5
     """fraction of each online batch drawn from the demos (rest from the online replay); 0 disables demos online"""
-    num_updates: int = 64
-    """gradient steps per parallel env step (UTD)"""
-    learning_starts: int = 1_000
-    """online steps to collect before online updates begin"""
-    batch_size: int = 256
+    num_updates: int = 256
+    """gradient steps per parallel env step (Squint's update-to-data ratio)"""
+    learning_starts: int = 5_000
+    """online steps to collect before online updates begin (Squint's value)"""
+    batch_size: int = 512
 
     horizon: int = 5
     """action chunk length h"""
@@ -74,8 +76,9 @@ class ChunkExecutor:
     """Turns a chunk policy into a per-step get_action(rgb, state) closure: queries the agent every
     `horizon` steps and replays the chunk open-loop in between (as in qc's main_online.py)."""
 
-    def __init__(self, agent, action_scale, action_bias):
+    def __init__(self, agent, action_scale, action_bias, deterministic=False):
         self.agent, self.scale, self.bias = agent, action_scale, action_bias
+        self.deterministic = deterministic
         self.chunk, self.i = None, 0
 
     def reset(self):
@@ -83,7 +86,7 @@ class ChunkExecutor:
 
     def __call__(self, rgb, state):
         if self.chunk is None or self.i >= self.agent.cfg.horizon:
-            self.chunk, self.i = self.agent.act(rgb, state), 0
+            self.chunk, self.i = self.agent.act(rgb, state, deterministic=self.deterministic), 0
         a = self.chunk[:, self.i]
         self.i += 1
         return a * self.scale + self.bias
@@ -161,6 +164,8 @@ if __name__ == "__main__":
         agent.load_state_dicts(ckpt)
         print(f"Loaded checkpoint {args.checkpoint}")
     executor = ChunkExecutor(agent, act_scale, act_bias)
+    # evaluation acts deterministically, like Squint's get_eval_action (training rollouts stay stochastic)
+    eval_executor = ChunkExecutor(agent, act_scale, act_bias, deterministic=True)
 
     # Demo frames are stored clean; online frames come out of ColorJitterWrapper already jittered.
     # Apply the same per-observation jitter to every demo batch so both sources match.
@@ -190,8 +195,8 @@ if __name__ == "__main__":
             if step % 1000 == 0:
                 logger.log({f"offline/{k}": v.item() for k, v in info.items()}, step=step)
             if args.eval_freq > 0 and step > 0 and step % (args.eval_freq // 10) == 0:
-                executor.reset()
-                evaluate(args, eval_envs, executor, logger, eval_output_dir, max_episode_steps, step, tqdm.tqdm(total=0))
+                eval_executor.reset()
+                evaluate(args, eval_envs, eval_executor, logger, eval_output_dir, max_episode_steps, step, tqdm.tqdm(total=0))
         save(0)
 
     # ── Online ─────────────────────────────────────────────────────────────
@@ -217,9 +222,8 @@ if __name__ == "__main__":
 
     for iteration in range(args.num_total_iterations + 2):
         if args.eval_freq > 0 and ((global_step - args.num_envs) // args.eval_freq) < (global_step // args.eval_freq):
-            executor.reset()
-            evaluate(args, eval_envs, executor, logger, eval_output_dir, max_episode_steps, log_off + global_step, pbar)
-            executor.reset()  # training rollouts share the executor; drop the eval chunk
+            eval_executor.reset()
+            evaluate(args, eval_envs, eval_executor, logger, eval_output_dir, max_episode_steps, log_off + global_step, pbar)
             save(log_off + global_step)
 
         with torch.no_grad():

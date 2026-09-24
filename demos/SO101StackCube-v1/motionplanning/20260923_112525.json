@@ -1,0 +1,94 @@
+{
+  "env_info": {
+    "env_id": "SO101StackCube-v1",
+    "env_kwargs": {
+      "obs_mode": "none",
+      "control_mode": "pd_joint_pos",
+      "render_mode": "rgb_array",
+      "sim_backend": "cpu"
+    },
+    "max_episode_steps": 50
+  },
+  "commit_info": null,
+  "episodes": [
+    {
+      "episode_id": 0,
+      "episode_seed": 0,
+      "control_mode": "pd_joint_pos",
+      "elapsed_steps": 1363,
+      "reset_kwargs": {
+        "options": null,
+        "seed": 0
+      },
+      "success": false
+    },
+    {
+      "episode_id": 1,
+      "episode_seed": 2,
+      "control_mode": "pd_joint_pos",
+      "elapsed_steps": 942,
+      "reset_kwargs": {
+        "options": null,
+        "seed": 2
+      },
+      "success": false
+    },
+    {
+      "episode_id": 2,
+      "episode_seed": 3,
+      "control_mode": "pd_joint_pos",
+      "elapsed_steps": 3074,
+      "reset_kwargs": {
+        "options": null,
+        "seed": 3
+      },
+      "success": false
+    },
+    {
+      "episode_id": 3,
+      "episode_seed": 5,
+      "control_mode": "pd_joint_pos",
+      "elapsed_steps": 518,
+      "reset_kwargs": {
+        "options": null,
+        "seed": 5
+      },
+      "success": false
+    },
+    {
+      "episode_id": 4,
+      "episode_seed": 7,
+      "control_mode": "pd_joint_pos",
+      "elapsed_steps": 3189,
+      "reset_kwargs": {
+        "options": null,
+        "seed": 7
+      },
+      "success": false
+    },
+    {
+      "episode_id": 5,
+      "episode_seed": 8,
+      "control_mode": "pd_joint_pos",
+      "elapsed_steps": 471,
+      "reset_kwargs": {
+        "options": null,
+        "seed": 8
+      },
+      "success": false
+    },
+    {
+      "episode_id": 6,
+      "episode_seed": 9,
+      "control_mode": "pd_joint_pos",
+      "elapsed_steps": 48,
+      "reset_kwargs": {
+        "options": null,
+        "seed": 9
+      },
+      "success": false
+    }
+  ],
+  "source_type": "motionplanning",
+  "source_desc": "scripted SO101 stack_cube motion-planning solution"
+}

@@ -1,0 +1,16 @@
+{
+  "env_info": {
+    "env_id": "SO101StackCube-v1",
+    "env_kwargs": {
+      "obs_mode": "none",
+      "control_mode": "pd_joint_pos",
+      "render_mode": "rgb_array",
+      "sim_backend": "cpu"
+    },
+    "max_episode_steps": 50
+  },
+  "commit_info": null,
+  "episodes": [],
+  "source_type": "motionplanning",
+  "source_desc": "scripted SO101 stack_cube motion-planning solution"
+}

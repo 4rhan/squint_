@@ -1,0 +1,50 @@
+{
+  "env_info": {
+    "env_id": "SO101LiftCube-v1",
+    "env_kwargs": {
+      "obs_mode": "none",
+      "control_mode": "pd_joint_pos",
+      "render_mode": "rgb_array",
+      "sim_backend": "cpu"
+    },
+    "max_episode_steps": 50
+  },
+  "commit_info": null,
+  "episodes": [
+    {
+      "episode_id": 0,
+      "episode_seed": 0,
+      "control_mode": "pd_joint_pos",
+      "elapsed_steps": 108,
+      "reset_kwargs": {
+        "options": null,
+        "seed": 0
+      },
+      "success": false
+    },
+    {
+      "episode_id": 1,
+      "episode_seed": 1,
+      "control_mode": "pd_joint_pos",
+      "elapsed_steps": 6453,
+      "reset_kwargs": {
+        "options": null,
+        "seed": 1
+      },
+      "success": false
+    },
+    {
+      "episode_id": 2,
+      "episode_seed": 2,
+      "control_mode": "pd_joint_pos",
+      "elapsed_steps": 8293,
+      "reset_kwargs": {
+        "options": null,
+        "seed": 2
+      },
+      "success": false
+    }
+  ],
+  "source_type": "motionplanning",
+  "source_desc": "scripted SO101 lift_cube motion-planning solution"
+}

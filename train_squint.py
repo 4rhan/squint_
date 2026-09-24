@@ -82,6 +82,9 @@ class Args:
     """the id of the environment"""
     env_domain_randomization: bool = True
     """adds domain randomization flag if env supports it"""
+    stage2_start_prob: float = 0.0
+    """SO101Stack3Cube-v1 only: fraction of *training* episodes that start with itemB already stacked
+    on itemC (curriculum for the second stack). Eval envs always run the full task from scratch. 0 disables."""
     num_envs: int = 1024
     """the number of parallel environments"""
     num_eval_envs: int = 16
@@ -173,11 +176,13 @@ def evaluate(args, eval_envs, get_action_fn, logger, eval_output_dir, max_episod
     eval_metrics = defaultdict(list)
 
     # Track task-specific sub-goal flags across the eval rollout (present only on some tasks,
-    # e.g. SO101Stack3Cube-v1's is_itemB_on_itemC / is_itemA_grasped / is_itemA_on_itemB), so we
+    # e.g. SO101Stack3Cube-v1's is_itemB_on_itemC / is_itemA_grasped / is_itemA_on_itemB, or
+    # SO101Place3Cube-v1's in_bin_ge1/2/3 = at least 1/2/3 cubes in the bin at once), so we
     # can see *where* in a multi-stage task the policy gets stuck during training, not just final
     # success. Eval envs run ignore_terminations=True by default so the whole batch stays on the
     # same episode for this entire loop, making a plain OR-accumulation safe here.
-    stage_flag_keys = ["is_itemB_on_itemC", "is_itemA_grasped", "is_itemA_on_itemB"]
+    stage_flag_keys = ["is_itemB_on_itemC", "is_itemA_grasped", "is_itemA_on_itemB",
+                       "in_bin_ge1", "in_bin_ge2", "in_bin_ge3"]
     stage_once = {}
 
     for _ in range(max_episode_steps):
@@ -603,6 +608,8 @@ if __name__ == "__main__":
     if args.env_domain_randomization:
         env_kwargs["domain_randomization"] = True
         eval_env_kwargs["domain_randomization"] = True
+    if args.stage2_start_prob > 0 and not args.evaluate:
+        env_kwargs["stage2_start_prob"] = args.stage2_start_prob
 
     envs = gym.make(args.env_id, num_envs=args.num_envs if not args.evaluate else 1,
                     reconfiguration_freq=args.reconfiguration_freq, **env_kwargs)

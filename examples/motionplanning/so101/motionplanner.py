@@ -16,6 +16,7 @@ A grasp is specified by the object center relative to the fixed jaw face and
 fingertip, with the jaw normal horizontal and aligned to an object face.
 """
 import numpy as np
+from scipy.interpolate import PchipInterpolator
 from scipy.optimize import least_squares
 from transforms3d.axangles import mat2axangle
 from transforms3d.quaternions import quat2mat
@@ -23,6 +24,7 @@ from transforms3d.quaternions import quat2mat
 
 class SO101GraspSolver:
     MAX_JOINT_STEP = 0.2  # rad per 10 Hz control step (~2 rad/s); faster costs stack success
+    MAX_JOINT_ACCEL = 0.06  # rad per step^2 for the smooth trajectory profile
     FACE_CLEARANCE = 0.004  # gap left between fixed jaw and object face on approach
     TIP_CLEARANCE = 0.003  # physical fingertips sit this far above the object's bottom face
     MIN_JAW_Z = 0.002  # lowest point of either jaw (at the commanded angle) must stay above the table
@@ -62,6 +64,7 @@ class SO101GraspSolver:
         self.gripper_target = float(self.qpos()[5])
         self.half = None
         self._place_jaw_perp = None  # optional: keep the jaw normal perpendicular to this while placing
+        self._pending = []  # queued (arm_q, speed_scale, gripper) waypoints, executed by flush()
         self.last_step = None
 
     # ------------------------------------------------------------ kinematics
@@ -170,7 +173,7 @@ class SO101GraspSolver:
         filters converged solutions, the lowest `score` wins."""
 
         jacobian = self._numeric_jacobian(residuals)
-        ref = self.qpos()[:5] if seed is None else np.asarray(seed, dtype=np.float64)
+        ref = self._planned_arm() if seed is None else np.asarray(seed, dtype=np.float64)
         pan = np.arctan2(target[1] - self._root_t[1], target[0] - self._root_t[0])
         seeds = [ref]
         for lift in (-0.6, 0.0, 0.6):
@@ -340,19 +343,72 @@ class SO101GraspSolver:
     def _commanded_arm(self):
         return self.base_env.agent.controller._target_qpos[0, :5].cpu().numpy().astype(np.float64)
 
-    def move_to(self, arm_q, g=None, speed_scale=1.0, settle=1):
-        """Smooth joint-space move to arm_q while commanding gripper angle g."""
-        g = self.gripper_target if g is None else g
-        start = self._commanded_arm()
-        n = max(1, int(np.ceil(np.max(np.abs(arm_q - start)) / (self.MAX_JOINT_STEP * speed_scale))))
-        for i in range(1, n + 1):
-            s = 0.5 - 0.5 * np.cos(np.pi * i / n)
-            self._step(start + s * (arm_q - start), g)
-        for _ in range(settle):
-            self._step(arm_q, g)
+    def _planned_arm(self):
+        """Arm joints once all queued motion has run."""
+        return self._pending[-1][0] if self._pending else self._commanded_arm()
+
+    def queue(self, arm_q, speed_scale=1.0):
+        """Add a waypoint (with the current gripper command) to the pending
+        trajectory. Nothing moves until flush()."""
+        self._pending.append((np.asarray(arm_q, dtype=np.float64), speed_scale, self.gripper_target))
+
+    def flush(self):
+        """Execute all queued waypoints as ONE continuous trajectory: a C1
+        (PCHIP) curve through the waypoints, time-parameterised with a
+        velocity limit per segment and an acceleration limit, starting and
+        ending at rest. The arm therefore only stops where flush() is called
+        (before the gripper closes/opens), not at every waypoint."""
+        if not self._pending:
+            return self.last_step
+        pts, vmax, grip = [self._commanded_arm()], [], []
+        for q, speed, g in self._pending:
+            if np.max(np.abs(q - pts[-1])) > 1e-6:
+                pts.append(q)
+                vmax.append(self.MAX_JOINT_STEP * speed)
+                grip.append(g)
+        last_g = self._pending[-1][2]
+        self._pending = []
+        if len(pts) == 1:
+            self.gripper_target = last_g
+            return self.last_step
+        pts = np.array(pts)
+        seg = np.max(np.abs(np.diff(pts, axis=0)), axis=1)  # max-joint distance per segment
+        s_nodes = np.concatenate([[0.0], np.cumsum(seg)])
+        curve = PchipInterpolator(s_nodes, pts, axis=0)
+
+        # Sample the curve densely and measure its true arc length (max-joint
+        # metric): between sparse waypoints the curve bends, so timing on the
+        # straight-line segment lengths would exceed the joint speed limit.
+        u, v_lim, seg_of = [0.0], [0.0], [0]
+        for i, L in enumerate(seg):
+            m = max(2, int(np.ceil(L / 0.005)))
+            for k in range(1, m + 1):
+                u.append(s_nodes[i] + L * k / m)
+                v_lim.append(vmax[i] if k < m or i == len(seg) - 1 else min(vmax[i], vmax[i + 1]))
+                seg_of.append(i)
+        u, v_lim = np.array(u), np.array(v_lim)
+        arc = np.concatenate([[0.0], np.cumsum(np.max(np.abs(np.diff(curve(u), axis=0)), axis=1))])
+        ds = np.maximum(np.diff(arc), 1e-9)
+
+        acc = self.MAX_JOINT_ACCEL
+        v = v_lim.copy()
+        v[0] = 0.0
+        for j in range(len(ds)):  # forward pass: acceleration limit
+            v[j + 1] = min(v[j + 1], np.sqrt(v[j] ** 2 + 2 * acc * ds[j]))
+        v[-1] = 0.0
+        for j in range(len(ds) - 1, -1, -1):  # backward pass: deceleration limit
+            v[j] = min(v[j], np.sqrt(v[j + 1] ** 2 + 2 * acc * ds[j]))
+        t = np.concatenate([[0.0], np.cumsum(2 * ds / np.maximum(v[:-1] + v[1:], 1e-9))])
+        n = max(1, int(np.ceil(t[-1])))
+        for k in range(1, n + 1):
+            j = min(int(np.searchsorted(t, t[-1] * k / n)), len(u) - 1)
+            u_k = np.interp(t[-1] * k / n, t, u)
+            self._step(curve(u_k), grip[seg_of[j]])
+        self.gripper_target = last_g
         return self.last_step
 
     def hold(self, steps, g=None):
+        self.flush()
         g = self.gripper_target if g is None else g
         arm_q = self._commanded_arm()
         for _ in range(steps):
@@ -368,11 +424,6 @@ class SO101GraspSolver:
             v = np.array([col[0], col[1], 0.0])
             axes.append(v / np.linalg.norm(v))
         return tuple(axes)
-
-    def follow(self, path, g=None):
-        for q in path:
-            self._step(q, self.gripper_target if g is None else g)
-        return self.last_step
 
     def pick(self, actor, half_size, approach_height=0.05, lift_height=0.06):
         """Top-down grasp of a box-shaped actor, then lift straight up.
@@ -394,18 +445,22 @@ class SO101GraspSolver:
         if len(up) < 2:
             return False
 
-        self.move_to(up[-1])
-        self.follow(up[-2::-1])
-        self.hold(1)
+        self.queue(up[-1])
+        for q in up[-2::-1]:
+            self.queue(q, speed_scale=0.5)
+        self.hold(1)  # flushes: the arm comes to rest only here, just before closing
         self.gripper_target = self.g_squeeze
         self.hold(3)
+        grasped = bool(self.agent.is_grasping(actor)[0])
         # Once held, the jaw orientation no longer matters much, so lift with
-        # the held-object IK (cube kept near flat), which reaches further.
+        # the held-object IK (cube kept near flat), which reaches further. The
+        # lift is only queued, so it blends into the carry done by place().
         self.measure_held(actor)
         lift = self.vertical_path(self._commanded_arm(), self.held_frame(self._commanded_arm())[0],
                                   lift_height, held=True)
-        self.follow(lift[1:])
-        return bool(self.agent.is_grasping(actor)[0])
+        for q in lift[1:]:
+            self.queue(q, speed_scale=0.7)
+        return grasped
 
     def place(self, actor, target_center, face_axes=None, jaw_perp=None, release_height=0.005,
               approach_height=0.04, retreat_height=0.05, release_gap=0.03):
@@ -438,16 +493,17 @@ class SO101GraspSolver:
         if len(down) < 2:
             return False
 
-        self.move_to(down[-1])
-        self.follow(down[-2::-1])
-        self.hold(1)
+        self.queue(down[-1])
+        for q in down[-2::-1]:
+            self.queue(q, speed_scale=0.5)
+        self.hold(1)  # flushes lift + carry + descent as one motion
         self._servo_held(actor, self.held_frame(q_place)[0], face_axes)
         self.gripper_target = self.gripper_qpos_for_gap(2 * self.half + release_gap)
         self.hold(3)
         q_now = self._commanded_arm()
         fk = self._fk(q_now, self.gripper_target, ("gl",))
-        q_retreat = self._retreat_ik(q_now, fk["gl"][0] + [0, 0, retreat_height])
-        self.move_to(q_retreat, speed_scale=0.7)
+        # queued, so it blends into whatever comes next (next pick / final rest)
+        self.queue(self._retreat_ik(q_now, fk["gl"][0] + [0, 0, retreat_height]), speed_scale=0.7)
         self._place_jaw_perp = None
         return True
 

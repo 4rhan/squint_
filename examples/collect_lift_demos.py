@@ -17,8 +17,8 @@ obs_mode / control_mode Squint actually trains with afterwards via
         --num-procs 4
 
 Usage:
-    python examples/collect_lift_demos.py -n 200 --only-count-success
-    python examples/collect_lift_demos.py -n 1 --vis --save-video  # sanity check
+    python -m examples.collect_lift_demos -n 200 --only-count-success
+    python -m examples.collect_lift_demos -n 1 --vis --save-video  # sanity check
 """
 import argparse
 import os.path as osp
@@ -67,7 +67,7 @@ def main(args):
         trajectory_name=traj_name,
         save_video=args.save_video,
         source_type="motionplanning",
-        source_desc="scripted SO101 lift_cube motion-planning solution",
+        source_desc="scripted SO101 lift_cube solution (IK + joint interpolation)",
         video_fps=30,
         record_reward=False,
         save_on_reset=False,

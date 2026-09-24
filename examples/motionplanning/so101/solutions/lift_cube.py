@@ -10,5 +10,5 @@ def solve(env, seed=None, debug=False, vis=False):
 
     if not solver.pick(e.item, e.item_half_sizes[0].item()):
         return -1
-    solver.move_to(e.rest_qpos[:5].cpu().numpy(), solver.g_squeeze)
+    solver.queue(e.rest_qpos[:5].cpu().numpy())
     return solver.hold(2)

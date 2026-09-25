@@ -482,7 +482,7 @@ class Place3(DefaultCameraEnv):
         return self.compute_dense_reward(obs=obs, action=action, info=info) / 26
 
 
-@register_env("SO101Place3Cube-v1", max_episode_steps=150)
+@register_env("SO101Place3Cube-v1", max_episode_steps=250)
 class Place3Cube(Place3):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)

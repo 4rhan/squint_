@@ -21,6 +21,8 @@ from scipy.optimize import least_squares
 from transforms3d.axangles import mat2axangle
 from transforms3d.quaternions import quat2mat
 
+from examples.motionplanning.so101.collision import CollisionModel
+
 
 class SO101GraspSolver:
     MAX_JOINT_STEP = 0.2  # rad per 10 Hz control step (~2 rad/s); faster costs stack success
@@ -40,6 +42,13 @@ class SO101GraspSolver:
     SERVO_ITERS = 4  # closed-loop place corrections
     APPROACH_H, LIFT_H, PLACE_APPROACH_H, RETREAT_H = 0.05, 0.06, 0.04, 0.05
     MAX_FACE_MISALIGN_DEG = 15.0  # jaw vs cube face yaw error tolerated when exact alignment is out of reach
+    JAW_CLEARANCE = 0.0005  # required moving-jaw clearance to obstacles while opening/closing at the object
+    OPEN_EXTRA_FALLBACK = (0.006, 0.004, 0.003)  # narrower jaw openings tried when the wide one hits a wall
+    MISALIGNED_GRASP_DEG = 35.0  # last-resort jaw/face yaw error at the reach limit
+    PICK_RETRIES = 2
+    # Multistart IK accepts at 2 mm (residuals are in cm), so scipy's 1e-8 defaults only burn
+    # iterations on seeds that are converging to a far-off local minimum anyway.
+    LSQ_OPTS = dict(ftol=1e-6, xtol=1e-6, gtol=1e-6, max_nfev=40)  # re-grasp attempts after a detected miss
 
     def __init__(self, env, vis: bool = False):
         self.env = env
@@ -68,6 +77,8 @@ class SO101GraspSolver:
         self.CLOSED, self.OPEN = float(limits[5, 0]), float(limits[5, 1])
 
         self._measure_gripper()
+        self.collision = CollisionModel(self)
+        self.n_retries = 0
 
         # In delta control (Squint's default, pd_joint_target_delta_pos) each action moves the joint
         # targets by at most the controller limits (0.1 rad arm, 0.2 rad gripper per step), so the
@@ -88,6 +99,7 @@ class SO101GraspSolver:
         self.last_place_err = None
         self.gripper_target = float(self.qpos()[5])
         self.half = None
+        self._face_extra = 0.0  # fixed-jaw standoff for a yaw-misaligned grasp (rotated cube is wider)
         self._place_jaw_perp = None  # optional: keep the jaw normal perpendicular to this while placing
         self._pending = []  # queued (arm_q, speed_scale, gripper) waypoints, executed by flush()
         self.last_step = None
@@ -174,7 +186,7 @@ class SO101GraspSolver:
         p_gl, R_gl = self._fk(arm_q, self.gripper_target, ("gl",))["gl"]
         local = (
             self.fixed_tip_local
-            + (self.half + self.FACE_CLEARANCE) * self.normal_local
+            + (self.half + self.FACE_CLEARANCE + self._face_extra) * self.normal_local
             - (self.half - self.TIP_CLEARANCE) * self.finger_local
         )
         return p_gl + R_gl @ local, R_gl @ self.normal_local, R_gl @ self.finger_local
@@ -211,7 +223,8 @@ class SO101GraspSolver:
         def consider(seed_q):
             nonlocal best, best_score
             seed_q = np.clip(seed_q, self.arm_lo + 1e-3, self.arm_hi - 1e-3)
-            sol = least_squares(residuals, seed_q, jac=jacobian, bounds=(self.arm_lo + 1e-4, self.arm_hi - 1e-4))
+            sol = least_squares(residuals, seed_q, jac=jacobian, bounds=(self.arm_lo + 1e-4, self.arm_hi - 1e-4),
+                                **self.LSQ_OPTS)
             if not accept(sol.x):
                 return False
             # Depending on the branch, the open moving jaw can hang lower than
@@ -275,7 +288,31 @@ class SO101GraspSolver:
             # trade a little yaw alignment for reaching the object at all
             residuals, accept = self._grasp_problem(target, face_axes, tol, align_weight=0.05)
             q = self._least_squares_ik(residuals, target, seed, accept, score)
+        if q is None and face_axes is not None and self.MISALIGNED_GRASP_DEG > self.MAX_FACE_MISALIGN_DEG:
+            # Last resort at the reach limit: grasp up to MISALIGNED_GRASP_DEG off the faces.
+            # Squeezing turns the cube square to the jaws; pick() verifies the grasp and retries.
+            # The fixed jaw stands off by the rotated cube's wider footprint so it clears the corner.
+            q = self._misaligned_grasp(target, face_axes, seed, tol, score)
         return q
+
+    def _misaligned_grasp(self, target, face_axes, seed, tol, score):
+        lim = self.MAX_FACE_MISALIGN_DEG
+        self.MAX_FACE_MISALIGN_DEG = self.MISALIGNED_GRASP_DEG
+        try:
+            residuals, accept = self._grasp_problem(target, face_axes, tol, align_weight=0.05)
+            q = self._least_squares_ik(residuals, target, seed, accept, score)
+            for _ in range(2):  # standoff depends on the angle found, which depends on the standoff
+                if q is None:
+                    break
+                n = self.grasp_frame(q)[1]
+                a = np.arccos(min(1.0, max(abs(n @ face_axes[0]), abs(n @ face_axes[1]))))
+                self._face_extra = self.half * (np.cos(a) + np.sin(a) - 1.0)
+                q = self._least_squares_ik(residuals, target, q, accept, score)
+            if q is None:
+                self._face_extra = 0.0
+            return q
+        finally:
+            self.MAX_FACE_MISALIGN_DEG = lim
 
     def _local_solve(self, residuals, accept, seed):
         # small pull toward the previous waypoint keeps chained solutions on
@@ -297,6 +334,13 @@ class SO101GraspSolver:
         the object). Returns the list bottom -> top, possibly shorter than
         requested if the arm runs out of reach."""
         path = [q_bottom]
+        if not held and self._face_extra > 0 and self.MAX_FACE_MISALIGN_DEG < self.MISALIGNED_GRASP_DEG:
+            # a misaligned grasp needs an approach line with the same tolerance
+            lim, self.MAX_FACE_MISALIGN_DEG = self.MAX_FACE_MISALIGN_DEG, self.MISALIGNED_GRASP_DEG
+            try:
+                return self.vertical_path(q_bottom, bottom_target, height, face_axes, held, step, max_tilt_deg)
+            finally:
+                self.MAX_FACE_MISALIGN_DEG = lim
         n = int(round(height / step))
         for k in range(1, n + 1):
             t = np.asarray(bottom_target, dtype=np.float64) + [0, 0, height * k / n]
@@ -489,23 +533,69 @@ class SO101GraspSolver:
             axes.append(v / np.linalg.norm(v))
         return tuple(axes)
 
-    def pick(self, actor, half_size, approach_height=None, lift_height=None, open_extra=0.03):
+    def _jaw_clearance(self, arm_q, g_from, g_to, n=5):
+        """Worst moving-jaw clearance to scene obstacles over a gripper sweep."""
+        return min(self.collision.clearance(arm_q, g, links=("moving_jaw_so101_v1_link",))[0]
+                   for g in np.linspace(g_from, g_to, n))
+
+    def pick(self, actor, half_size, approach_height=None, lift_height=None, open_extra=0.03, retries=None):
         """Top-down grasp of a box-shaped actor, then lift straight up.
-        Returns True if the actor is grasped after lifting."""
+        Returns True if the actor is grasped after lifting. A missed grasp is
+        detected (is_grasping after closing) and retried from a re-measured
+        object pose, with the jaws opened back up and raised clear first."""
+        retries = self.PICK_RETRIES if retries is None else retries
+        for attempt in range(retries + 1):
+            ok = self._pick_once(actor, half_size, approach_height, lift_height, open_extra)
+            if ok or self.fail_reason != "pick_grasp" or attempt == retries:
+                return ok
+            self.n_retries += 1
+            # back off: open, rise straight up, and let the object settle
+            self._pending = []
+            self.set_gripper(self.g_open)
+            q = self._commanded_arm()
+            self.queue(self._retreat_ik(q, self._fk(q, self.gripper_target, ("gl",))["gl"][0] + [0, 0, 0.04]),
+                       speed_scale=0.7)
+            self.hold(2)
+            self.fail_reason = None
+        return False
+
+    def _pick_once(self, actor, half_size, approach_height, lift_height, open_extra):
         approach_height = self.APPROACH_H if approach_height is None else approach_height
         lift_height = self.LIFT_H if lift_height is None else lift_height
         self.half = half_size
+        self._face_extra = 0.0
         center = actor.pose.sp.p.astype(np.float64)
         axes = self.horizontal_axes(actor)
         g_contact = self.gripper_qpos_for_gap(2 * half_size)
-        g_open = self.gripper_qpos_for_gap(2 * half_size + open_extra)
         self.g_squeeze = max(self.CLOSED, g_contact - self.SQUEEZE)
+        self.collision.refresh(exclude=[actor])
 
-        self.gripper_target = g_open  # IK checks jaw clearance at this angle
-        q_grasp = self.solve_ik(center, axes)
+        # The open moving jaw must not start inside a pocket/tray wall or a
+        # neighbouring object, or it stalls there and never reaches the object
+        # (measured: >=1.2 mm overlap at open in every rearrange pick_grasp
+        # failure). Open only as wide as the surroundings allow.
+        q_grasp = None
+        for extra in sorted({open_extra, *[e for e in self.OPEN_EXTRA_FALLBACK if e < open_extra]}, reverse=True):
+            g_open = self.gripper_qpos_for_gap(2 * half_size + extra)
+            self.gripper_target = g_open  # IK checks jaw clearance at this angle
+            self._face_extra = 0.0
+            q = self.solve_ik(center, axes)
+            if q is None:
+                continue
+            if self._face_extra > 0:  # misaligned: the rotated cube is wider, open further
+                g_open = self.gripper_qpos_for_gap(2 * (half_size + self._face_extra) + extra)
+                self.gripper_target = g_open
+            clear = self._jaw_clearance(q, g_open, g_contact)
+            if q_grasp is None or clear > best_clear:
+                q_grasp, best_clear, best_open, best_extra = q, clear, g_open, self._face_extra
+            if clear >= self.JAW_CLEARANCE:
+                break
         if q_grasp is None:
             self.fail_reason = "pick_ik"
             return False
+        g_open = self.g_open = best_open
+        self._face_extra = best_extra
+        self.gripper_target = g_open
         # Near the edge of the workspace the approach line may run out of
         # reach early; accept a shorter one (>= 1 cm) rather than failing.
         up = self.vertical_path(q_grasp, center, approach_height, axes)

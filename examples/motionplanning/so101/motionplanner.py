@@ -232,11 +232,15 @@ class SO101GraspSolver:
                     consider(q)
         return best
 
-    def _grasp_problem(self, target, face_axes, tol, align_weight=1.0):
+    def _grasp_problem(self, target, face_axes, tol, align_weight=1.0, jaw_dir=None):
+        """`jaw_dir` (a horizontal unit vector) pins the *signed* direction from the fixed jaw to the
+        moving jaw, instead of allowing any of the cube's four face directions via `face_axes`."""
         def residuals(x):
             center, n, e = self.grasp_frame(x)
             r = [(center - target) * 100.0, [n[2]]]
-            if face_axes is not None:
+            if jaw_dir is not None:
+                r.append([align_weight * (1.0 - n @ jaw_dir)])
+            elif face_axes is not None:
                 a, b = face_axes
                 r.append([align_weight * (n @ a) * (n @ b)])
             return np.concatenate(r)
@@ -245,6 +249,8 @@ class SO101GraspSolver:
             center, n, _ = self.grasp_frame(x)
             if np.linalg.norm(center - target) > tol or abs(n[2]) > 0.05:
                 return False
+            if jaw_dir is not None:
+                return n @ jaw_dir > np.cos(np.deg2rad(self.MAX_FACE_MISALIGN_DEG))
             if face_axes is None:
                 return True
             cos = max(abs(n @ face_axes[0]), abs(n @ face_axes[1]))
@@ -252,7 +258,7 @@ class SO101GraspSolver:
 
         return residuals, accept
 
-    def solve_ik(self, target, face_axes=None, seed=None, tol=2e-3):
+    def solve_ik(self, target, face_axes=None, seed=None, tol=2e-3, jaw_dir=None):
         """Grasp IK: put grasp_frame's center at `target` with the jaw normal
         horizontal and parallel to one of `face_axes` (two horizontal unit
         vectors, e.g. a cube's face normals). That is exactly 5 constraints;
@@ -262,12 +268,12 @@ class SO101GraspSolver:
         (then closest to seed) wins. Returns None if nothing is within tol."""
         target = np.asarray(target, dtype=np.float64)
         score = lambda x: self.grasp_frame(x)[2][2]
-        residuals, accept = self._grasp_problem(target, face_axes, tol)
+        residuals, accept = self._grasp_problem(target, face_axes, tol, jaw_dir=jaw_dir)
         q = self._least_squares_ik(residuals, target, seed, accept, score)
-        if q is None and face_axes is not None:
+        if q is None and (face_axes is not None or jaw_dir is not None):
             # near the reach limit exact face alignment can be infeasible;
             # trade a little yaw alignment for reaching the object at all
-            residuals, accept = self._grasp_problem(target, face_axes, tol, align_weight=0.05)
+            residuals, accept = self._grasp_problem(target, face_axes, tol, align_weight=0.05, jaw_dir=jaw_dir)
             q = self._least_squares_ik(residuals, target, seed, accept, score)
         return q
 
@@ -284,7 +290,7 @@ class SO101GraspSolver:
         return sol.x if accept(sol.x) else None
 
     def vertical_path(self, q_bottom, bottom_target, height, face_axes=None, held=False, step=0.01,
-                      max_tilt_deg=40.0):
+                      max_tilt_deg=40.0, jaw_dir=None):
         """IK waypoints for a straight vertical line from bottom_target up by
         `height`, chained from q_bottom so the whole line stays on one IK
         branch (a plain joint-space interpolation arcs sideways and can shove
@@ -297,7 +303,7 @@ class SO101GraspSolver:
             if held:
                 residuals, accept = self._held_problem(t, 2e-3, max_tilt_deg, face_axes)
             else:
-                residuals, accept = self._grasp_problem(t, face_axes, 2e-3, align_weight=0.2)
+                residuals, accept = self._grasp_problem(t, face_axes, 2e-3, align_weight=0.2, jaw_dir=jaw_dir)
             q = self._local_solve(residuals, accept, path[-1])
             if q is None or self.lowest_jaw_z(q, self.gripper_target) < self.MIN_JAW_Z:
                 break
@@ -478,7 +484,37 @@ class SO101GraspSolver:
             axes.append(v / np.linalg.norm(v))
         return tuple(axes)
 
-    def pick(self, actor, half_size, approach_height=None, lift_height=None, open_extra=0.03):
+    def natural_jaw_dir(self, actor, half_size, open_extra=0.03):
+        """The jaw direction (horizontal unit vector from the fixed to the moving jaw) the arm would pick on
+        its own for a top-down grasp of `actor`, snapped to the nearest of the cube's four face directions;
+        None if unreachable. Leaves the solver state untouched."""
+        saved = (self.half, self.gripper_target)
+        self.half = half_size
+        self.gripper_target = self.gripper_qpos_for_gap(2 * half_size + open_extra)
+        axes = self.horizontal_axes(actor)
+        q = self.solve_ik(actor.pose.sp.p.astype(np.float64), axes)
+        n = None if q is None else self.grasp_frame(q)[1]
+        self.half, self.gripper_target = saved
+        if n is None:
+            return None
+        cands = (axes[0], -axes[0], axes[1], -axes[1])
+        return max(cands, key=lambda d: float(d @ n))
+
+    def grasp_feasible(self, actor, half_size, jaw_dir=None, open_extra=0.03, min_path=3):
+        """Is a top-down grasp of `actor` reachable, with a vertical approach line of at least
+        (min_path - 1) cm? Leaves the solver state untouched, so it can be used to reject an
+        unreachable scene before anything moves."""
+        saved = (self.half, self.gripper_target)
+        self.half = half_size
+        self.gripper_target = self.gripper_qpos_for_gap(2 * half_size + open_extra)
+        center = actor.pose.sp.p.astype(np.float64)
+        axes = self.horizontal_axes(actor)
+        q = self.solve_ik(center, axes, jaw_dir=jaw_dir)
+        ok = q is not None and len(self.vertical_path(q, center, 0.05, axes, jaw_dir=jaw_dir)) >= min_path
+        self.half, self.gripper_target = saved
+        return ok
+
+    def pick(self, actor, half_size, approach_height=None, lift_height=None, open_extra=0.03, jaw_dir=None):
         """Top-down grasp of a box-shaped actor, then lift straight up.
         Returns True if the actor is grasped after lifting."""
         approach_height = self.APPROACH_H if approach_height is None else approach_height
@@ -491,12 +527,12 @@ class SO101GraspSolver:
         self.g_squeeze = max(self.CLOSED, g_contact - self.SQUEEZE)
 
         self.gripper_target = g_open  # IK checks jaw clearance at this angle
-        q_grasp = self.solve_ik(center, axes)
+        q_grasp = self.solve_ik(center, axes, jaw_dir=jaw_dir)
         if q_grasp is None:
             return False
         # Near the edge of the workspace the approach line may run out of
         # reach early; accept a shorter one (>= 1 cm) rather than failing.
-        up = self.vertical_path(q_grasp, center, approach_height, axes)
+        up = self.vertical_path(q_grasp, center, approach_height, axes, jaw_dir=jaw_dir)
         if len(up) < 2:
             return False
 

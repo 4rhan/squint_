@@ -12,6 +12,13 @@ Output (one group per successful episode):
     traj_<i>/obs/state  (T+1, S)       float32
     traj_<i>/actions    (T, A)         float32   normalised env actions
     traj_<i>/rewards    (T,)           float32   normalized_dense
+    traj_<i>/gt/...     privileged ground-truth values from the simulator (ignored by the loader):
+        tcp_pose (T+1,7) end-effector pose [xyz, quat wxyz], qpos/qvel (T+1,J), per-object poses
+        (place3: cube_pose (T+1,3,7), bin_pose (T+1,7); stack/lift: item*_pose (T+1,7)), static sizes
+        (cube_half, bin_half), per-step task flags (success, num_in_bin) and the end-effector motion
+        implied by the demo: tcp_delta_pos (T,3) and tcp_delta_rotvec (T,3), world frame.
+Cube size is fixed for tasks whose cubes never change size in practice (see FIXED_CUBE_HALF); pass
+--random-cube-size to randomise it like the training env does.
 Episodes longer than the env horizon are dropped (a policy limited to that horizon can't imitate them)
 unless --keep-long.
 
@@ -43,6 +50,43 @@ SOLUTIONS = {
 }
 
 
+# half edge length (m) used when the task's cubes are not randomised; matches the mean of the env's range
+FIXED_CUBE_HALF = {"SO101Place3Cube-v1": 0.0125}
+
+
+def gt_state(e):
+    """Privileged ground-truth simulator values for num_envs=1, world frame. Only meant for the demo files
+    (e.g. asymmetric critics, debugging); it never enters the policy observation."""
+    n = lambda t: t[0].detach().cpu().numpy().astype(np.float32)
+    out = {"tcp_pose": n(e.agent.tcp_pose.raw_pose), "qpos": n(e.agent.robot.get_qpos()),
+           "qvel": n(e.agent.robot.get_qvel())}
+    if hasattr(e, "cubes"):  # place3
+        out["cube_pose"] = np.stack([n(c.pose.raw_pose) for c in e.cubes])
+        out["bin_pose"] = n(e.bin.pose.raw_pose)
+    for name in ("item", "itemA", "itemB", "itemC"):
+        if hasattr(e, name):
+            out[f"{name}_pose"] = n(getattr(e, name).pose.raw_pose)
+    return out
+
+
+def gt_static(e):
+    out = {}
+    if hasattr(e, "cube_half_sizes"):
+        out["cube_half"] = e.cube_half_sizes[0].detach().cpu().numpy().astype(np.float32).reshape(-1)
+    if hasattr(e, "bin_dimensions"):
+        out["bin_half"] = e.bin_dimensions[0].detach().cpu().numpy().astype(np.float32)
+    return out
+
+
+def eef_deltas(tcp_pose):
+    """Per-step end-effector motion implied by a (T+1, 7) pose sequence: position change and the world-frame
+    rotation vector taking the pose at t to t+1."""
+    from scipy.spatial.transform import Rotation as Rot
+    q = tcp_pose[:, [4, 5, 6, 3]]  # wxyz -> xyzw for scipy
+    r = Rot.from_quat(q)
+    return (tcp_pose[1:, :3] - tcp_pose[:-1, :3]).astype(np.float32), (r[1:] * r[:-1].inv()).as_rotvec().astype(np.float32)
+
+
 class EpisodeRecorder(gym.Wrapper):
     """Keeps the observations, actions and rewards of the current episode (num_envs=1)."""
 
@@ -50,6 +94,10 @@ class EpisodeRecorder(gym.Wrapper):
         obs, info = self.env.reset(**kwargs)
         self.rgb, self.state = [self._rgb(obs)], [self._state(obs)]
         self.actions, self.rewards = [], []
+        base = self.env.unwrapped
+        self.gt = {k: [v] for k, v in gt_state(base).items()}
+        self.gt_flags = {"success": [], "num_in_bin": []}
+        self.gt_const = gt_static(base)
         return obs, info
 
     def step(self, action):
@@ -58,6 +106,11 @@ class EpisodeRecorder(gym.Wrapper):
         self.state.append(self._state(obs))
         self.actions.append(np.asarray(action, dtype=np.float32).reshape(-1))
         self.rewards.append(float(torch.as_tensor(reward).reshape(-1)[0]))
+        for k, v in gt_state(self.env.unwrapped).items():
+            self.gt[k].append(v)
+        for k in self.gt_flags:
+            if k in info:
+                self.gt_flags[k].append(float(torch.as_tensor(info[k]).reshape(-1)[0]))
         return obs, reward, terminated, truncated, info
 
     @staticmethod
@@ -78,6 +131,12 @@ def make_env(args):
         kwargs["control_mode"] = args.control_mode
     if args.domain_randomization:
         kwargs["domain_randomization"] = True
+    fixed = FIXED_CUBE_HALF.get(args.env_id) if not args.random_cube_size else None
+    if args.fixed_cube_size is not None:
+        fixed = args.fixed_cube_size
+    if fixed is not None:
+        kwargs["domain_randomization_config"] = dict(cube_half_size_range=(fixed, fixed))
+    args.cube_half_used = fixed
     env = gym.make(args.env_id, num_envs=1, **kwargs)
     horizon = gym_utils.find_max_episode_steps_value(env)
     env = FlattenRGBDObservationWrapper(env, rgb=True, depth=False, state=True)
@@ -103,6 +162,9 @@ def parse_args():
     p.add_argument("--render-size", type=int, default=128)
     p.add_argument("--image-size", type=int, default=16)
     p.add_argument("--no-domain-randomization", dest="domain_randomization", action="store_false")
+    p.add_argument("--fixed-cube-size", type=float, default=None,
+                   help="cube half edge in metres; default is the fixed size in FIXED_CUBE_HALF for this task")
+    p.add_argument("--random-cube-size", action="store_true", help="randomise the cube size like the training env")
     p.add_argument("-b", "--sim-backend", default="cpu")
     return p.parse_args()
 
@@ -139,6 +201,17 @@ def main(args):
             g.create_dataset("obs/state", data=np.stack(env.state))
             g.create_dataset("actions", data=np.stack(env.actions))
             g.create_dataset("rewards", data=np.asarray(env.rewards, dtype=np.float32))
+            gt = g.create_group("gt")
+            for k, v in env.gt.items():
+                gt.create_dataset(k, data=np.stack(v))
+            for k, v in env.gt_flags.items():
+                if v:
+                    gt.create_dataset(k, data=np.asarray(v, dtype=np.float32))
+            for k, v in env.gt_const.items():
+                gt.create_dataset(k, data=v)
+            dpos, drot = eef_deltas(np.stack(env.gt["tcp_pose"]))
+            gt.create_dataset("tcp_delta_pos", data=dpos)
+            gt.create_dataset("tcp_delta_rotvec", data=drot)
             g.attrs["seed"] = seed - 1
             lengths.append(T)
             saved += 1

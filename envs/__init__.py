@@ -9,3 +9,6 @@ import envs.lift
 import envs.place
 import envs.stack
 import envs.stack3
+import envs.tower
+import envs.tray_pack
+import envs.rearrange

@@ -39,6 +39,11 @@ from .robot.so100 import SO100
 from .robot.so101 import SO101
 
 
+def _yaw_from_quat(q: torch.Tensor) -> torch.Tensor:
+    w, x, y, z = q[..., 0], q[..., 1], q[..., 2], q[..., 3]
+    return torch.atan2(2 * (w * z + x * y), 1 - 2 * (y * y + z * z))
+
+
 @dataclass
 class TowerRandomizationConfig(DefaultRandomizationConfig):
     robot_qpos_noise_std: float = np.deg2rad(5)
@@ -223,6 +228,7 @@ class TowerBase(DefaultCameraEnv):
         # Per-env bookkeeping (dwell + latch for stack-loss diagnostic).
         self._dwell_count = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
         self._was_complete = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        self._dwell_last_step = torch.full((self.num_envs,), -1, dtype=torch.long, device=self.device)
         self._dwell_steps = max(1, int(round(self.dwell_time * self._sim_config.control_freq
                                             if hasattr(self, "_sim_config") and self._sim_config is not None else 10)))
 
@@ -266,6 +272,7 @@ class TowerBase(DefaultCameraEnv):
             # Reset dwell/latch for these envs.
             self._dwell_count[env_idx] = 0
             self._was_complete[env_idx] = False
+            self._dwell_last_step[env_idx] = -1
             # Recompute dwell steps in case control freq changed (cheap).
             try:
                 self._dwell_steps = max(1, int(round(self.dwell_time * self.control_freq)))
@@ -295,6 +302,7 @@ class TowerBase(DefaultCameraEnv):
         xyL = rand_xy_for(base_centers)
         xyM = rand_xy_for(base_centers)
         xyS = rand_xy_for(base_centers) if self.NUM_CUBES == 3 else None
+        valid = torch.zeros(b, dtype=torch.bool, device=dev)
         for _ in range(max_tries):
             d_LM = torch.linalg.norm(xyL - xyM, dim=1)
             ok = d_LM >= self.min_obj_separation
@@ -309,16 +317,31 @@ class TowerBase(DefaultCameraEnv):
                 ok &= d_MS >= self.min_obj_separation
                 ok &= torch.linalg.norm(xyS, dim=1) <= self.max_reach_radius
             if bool(ok.all()):
+                valid = torch.ones_like(valid)
                 break
             bad = ~ok
             nb = int(bad.sum().item())
             if nb == 0:
+                valid = ok
                 break
             bad_centers = base_centers[bad]
             xyL[bad] = rand_xy_for(bad_centers)
             xyM[bad] = rand_xy_for(bad_centers)
             if self.NUM_CUBES == 3:
                 xyS[bad] = rand_xy_for(bad_centers)
+        else:
+            valid = ok
+        if not bool(valid.all()):
+            import warnings
+            warnings.warn(f"Tower rejection sampling exhausted for {(~valid).sum().item()}/{b} envs; using fallback layout")
+            fb_L = torch.tensor([0.22, -0.06], device=dev)
+            fb_M = torch.tensor([0.22, 0.06], device=dev)
+            fb_S = torch.tensor([0.26, 0.0], device=dev)
+            nfb = int((~valid).sum().item())
+            xyL[~valid] = fb_L.unsqueeze(0).expand(nfb, -1)
+            xyM[~valid] = fb_M.unsqueeze(0).expand(nfb, -1)
+            if self.NUM_CUBES == 3:
+                xyS[~valid] = fb_S.unsqueeze(0).expand(nfb, -1)
         # Build xyz (z = half size resting on table z=0).
         out = {}
         zL = half_L
@@ -367,31 +390,39 @@ class TowerBase(DefaultCameraEnv):
         return obs
 
     # ------------------------------------------------------------------ checks
-    def _support_check(self, p_top, half_top, p_bot, half_bot, bot_is_table=False):
-        """Geometric + contact support check for unequal cubes.
+    def _support_check(self, p_top, q_top, half_top, p_bot, q_bot, half_bot):
+        """Orientation-aware support for unequal cubes.
 
-        Requires: (a) top fully supported in xy (offset <= (half_bot-half_top)+tol
-        when bottom is a cube; centered on tower target handled separately),
-        (b) vertical contact (z gap within tol), (c) object-object contact force.
-        Height/centre-distance alone are NOT sufficient: (a) enforces overhang
-        limits for unequal sizes.
+        Requires: (a) all 4 bottom corners of the top cube fall inside the
+        bottom cube's top face (+2mm margin), accounting for both yaws;
+        (b) vertical contact; (c) contact/static. Corner checks replace
+        centre-distance so overhanging placements fail even when centres
+        are close.
         """
-        offset = p_top - p_bot
-        xy_dist = torch.linalg.norm(offset[:, :2], dim=1)
-        if bot_is_table:
-            xy_ok = torch.ones_like(xy_dist, dtype=torch.bool)  # table is large
-            z_gap = p_top[:, 2] - half_top  # height of bottom face above table
-            z_ok = (z_gap >= -self.tower_tol_z) & (z_gap <= self.tower_tol_z)
-            contact_ok = z_ok  # table contact implied by z; force check noisy on table
-        else:
-            allow = (half_bot - half_top) + self.support_xy_tol
-            allow = torch.clamp(allow, min=0.002)
-            xy_ok = xy_dist <= allow
-            expected_dz = half_top + half_bot
-            z_gap = torch.abs(offset[:, 2] - expected_dz)
-            z_ok = z_gap <= self.support_z_tol
-            contact_ok = z_ok  # refined with force below where available
-        return xy_dist, z_gap if not bot_is_table else z_gap, xy_ok & z_ok, contact_ok
+        yaw_top = _yaw_from_quat(q_top)
+        yaw_bot = _yaw_from_quat(q_bot)
+        ct, st = torch.cos(yaw_top), torch.sin(yaw_top)
+        # top corners in world (N,4,2)
+        s = half_top.unsqueeze(1)
+        corners = torch.stack([
+            torch.stack([s[:, 0] * ct - s[:, 0] * st, s[:, 0] * st + s[:, 0] * ct], dim=1),
+            torch.stack([s[:, 0] * ct + s[:, 0] * st, s[:, 0] * st - s[:, 0] * ct], dim=1),
+            torch.stack([-s[:, 0] * ct - s[:, 0] * st, -s[:, 0] * st + s[:, 0] * ct], dim=1),
+            torch.stack([-s[:, 0] * ct + s[:, 0] * st, -s[:, 0] * st - s[:, 0] * ct], dim=1),
+        ], dim=1) + (p_top[:, :2].unsqueeze(1))
+        # into bottom frame
+        rel = corners - p_bot[:, :2].unsqueeze(1)
+        cb, sb = torch.cos(-yaw_bot), torch.sin(-yaw_bot)
+        lx = rel[:, :, 0] * cb - rel[:, :, 1] * sb
+        ly = rel[:, :, 0] * sb + rel[:, :, 1] * cb
+        margin = 0.002
+        allow = half_bot.unsqueeze(1) + margin
+        xy_ok = ((lx.abs() <= allow) & (ly.abs() <= allow)).all(dim=1)
+        expected_dz = half_top + half_bot
+        z_gap = torch.abs((p_top[:, 2] - p_bot[:, 2]) - expected_dz)
+        z_ok = z_gap <= self.support_z_tol
+        xy_dist = torch.linalg.norm((p_top - p_bot)[:, :2], dim=1)
+        return xy_dist, z_gap, xy_ok & z_ok, z_ok
 
     def _contact_force(self, a, b):
         try:
@@ -410,8 +441,9 @@ class TowerBase(DefaultCameraEnv):
         base_xy = torch.linalg.norm(pL[:, :2] - tower_xy, dim=1)
         base_z_gap = pL[:, 2] - self.large_half
         base_placed = (base_xy <= self.tower_tol_xy) & (base_z_gap.abs() <= self.tower_tol_z)
-        # Medium on large.
-        _, _, geom_M, _ = self._support_check(pM, self.medium_half, pL, self.large_half)
+        # Medium on large (orientation-aware corners).
+        _, _, geom_M, _ = self._support_check(pM, self.cubeM.pose.q, self.medium_half,
+                                              pL, self.cubeL.pose.q, self.large_half)
         f_ML = self._contact_force(self.cubeM, self.cubeL)
         contact_ML = f_ML >= self.contact_force_thresh
         # Require geometry; contact force is supplementary (stable sim contact
@@ -422,7 +454,8 @@ class TowerBase(DefaultCameraEnv):
         medium_supported = geom_M & (contact_ML | static_ML)
         if self.NUM_CUBES == 3:
             pS = self.cubeS.pose.p
-            _, _, geom_S, _ = self._support_check(pS, self.small_half, pM, self.medium_half)
+            _, _, geom_S, _ = self._support_check(pS, self.cubeS.pose.q, self.small_half,
+                                                  pM, self.cubeM.pose.q, self.medium_half)
             f_SM = self._contact_force(self.cubeS, self.cubeM)
             contact_SM = f_SM >= self.contact_force_thresh
             vS = torch.linalg.norm(self.cubeS.linear_velocity, dim=-1)
@@ -458,12 +491,14 @@ class TowerBase(DefaultCameraEnv):
 
     def evaluate(self):
         inst = self._instantaneous()
-        # Dwell bookkeeping (per-env; reset in _initialize_episode).
-        # NOTE: evaluate() is called once per control step via get_info().
-        self._was_complete = self._was_complete | inst["complete_stable"]
-        self._dwell_count = torch.where(inst["complete_stable"],
-                                        self._dwell_count + 1,
-                                        torch.zeros_like(self._dwell_count))
+        # Dwell advances once per control step only (repeated evaluate() w/o step is free).
+        cur_step = self.elapsed_steps.reshape(-1).to(torch.long).to(self.device)
+        new_step = cur_step != self._dwell_last_step
+        self._was_complete = torch.where(new_step, self._was_complete | inst["complete_stable"], self._was_complete)
+        self._dwell_count = torch.where(
+            ~new_step, self._dwell_count,
+            torch.where(inst["complete_stable"], self._dwell_count + 1, torch.zeros_like(self._dwell_count)))
+        self._dwell_last_step = torch.where(new_step, cur_step, self._dwell_last_step)
         success = self._dwell_count >= self._dwell_steps
         stack_lost = self._was_complete & (~inst["complete"])
         out = dict(success=success,
@@ -533,14 +568,14 @@ class TowerBase(DefaultCameraEnv):
         return self.compute_dense_reward(obs=obs, action=action, info=info) / max_r
 
 
-@register_env("SO101Tower3Cube-v1", max_episode_steps=200)
+@register_env("SO101Tower3Cube-v1", max_episode_steps=300)
 class Tower3Cube(TowerBase):
     NUM_CUBES = 3
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
 
-@register_env("SO101Tower2Cube-v1", max_episode_steps=150)
+@register_env("SO101Tower2Cube-v1", max_episode_steps=200)
 class Tower2Cube(TowerBase):
     NUM_CUBES = 2
     def __init__(self, *args, **kwargs):

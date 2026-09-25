@@ -160,6 +160,10 @@ class Args:
     # to be filled in runtime
     num_total_iterations: int = 0
     """the number of parallel envs steps given global total timesteps"""
+    time_budget: Optional[float] = None
+    """wall-clock training budget in seconds (excludes evaluation time); stops early with final eval+save when exceeded. E.g. 900 for 15-min pilots"""
+    eval_seed: Optional[int] = None
+    """evaluation environment seed (distinct from training seed; defaults to seed+1000)"""
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -172,13 +176,18 @@ def evaluate(args, eval_envs, get_action_fn, logger, eval_output_dir, max_episod
     eval_obs, _ = eval_envs.reset()
     eval_metrics = defaultdict(list)
 
-    # Track task-specific sub-goal flags across the eval rollout (present only on some tasks,
-    # e.g. SO101Stack3Cube-v1's is_itemB_on_itemC / is_itemA_grasped / is_itemA_on_itemB), so we
-    # can see *where* in a multi-stage task the policy gets stuck during training, not just final
-    # success. Eval envs run ignore_terminations=True by default so the whole batch stays on the
+    # Track task-agnostic diagnostics across the eval rollout. Includes the
+    # original Stack3 keys plus Tower/Pack/Rearrange flags so multi-stage
+    # progress is visible for every compared method, not just final success.
+    # Eval envs run ignore_terminations=True by default so the whole batch stays on the
     # same episode for this entire loop, making a plain OR-accumulation safe here.
-    stage_flag_keys = ["is_itemB_on_itemC", "is_itemA_grasped", "is_itemA_on_itemB"]
+    stage_flag_keys = ["is_itemB_on_itemC", "is_itemA_grasped", "is_itemA_on_itemB",
+                       "base_placed", "medium_supported", "small_supported",
+                       "tower_complete", "tower_complete_stable",
+                       "complete", "complete_stable", "buffer_empty",
+                       "is_released", "is_base_placed", "is_medium_on_base"]
     stage_once = {}
+    max_num_correct = None
 
     for _ in range(max_episode_steps):
         with torch.no_grad():
@@ -186,8 +195,11 @@ def evaluate(args, eval_envs, get_action_fn, logger, eval_output_dir, max_episod
             eval_obs, _, _, _, eval_infos = eval_envs.step(eval_action)
             for key in stage_flag_keys:
                 if key in eval_infos:
-                    stage_once.setdefault(key, torch.zeros_like(eval_infos[key]))
-                    stage_once[key] |= eval_infos[key]
+                    stage_once.setdefault(key, torch.zeros_like(eval_infos[key].reshape(-1)).bool())
+                    stage_once[key] |= eval_infos[key].reshape(-1).bool()
+            if "num_correct" in eval_infos:
+                nc = eval_infos["num_correct"].reshape(-1).float()
+                max_num_correct = nc.clone() if max_num_correct is None else torch.maximum(max_num_correct, nc)
             if "final_info" in eval_infos:
                 mask = eval_infos["_final_info"]
                 for k, v in eval_infos["final_info"]["episode"].items():
@@ -198,6 +210,8 @@ def evaluate(args, eval_envs, get_action_fn, logger, eval_output_dir, max_episod
         eval_d[k] = torch.stack(v).float().mean()
     for key, flags in stage_once.items():
         eval_d[f"eval/{key}_once"] = flags.float().mean()
+    if max_num_correct is not None:
+        eval_d["eval/max_num_correct"] = max_num_correct.float().mean()
 
     desc = (
         f"success_at_end: {eval_d['eval/success_at_end']:.2f}, "
@@ -530,18 +544,49 @@ class DeployAgent(nn.Module):
 # ─────────────────────────────────────────────────────────────────────────────
 
 class Logger:
-    def __init__(self, log_wandb=False):
+    def __init__(self, log_wandb=False, run_dir=None):
         self.log_wandb = log_wandb
         self.start_time = time.perf_counter()
         self.total_eval_time = 0 # to subtract from total wall_time
+        self.run_dir = run_dir
+        self.csv_path = os.path.join(run_dir, "metrics.csv") if run_dir else None
+        self._csv_header = None
 
     @property
     def wall_time(self):
+        """Training time excluding evaluation (setup+compile included, eval excluded)."""
         return time.perf_counter() - self.start_time - self.total_eval_time
 
+    @property
+    def total_time(self):
+        """Total elapsed including evaluation (setup+compile+train+eval)."""
+        return time.perf_counter() - self.start_time
+
+    def _flat(self, d):
+        row = {}
+        for k, v in d.items():
+            if isinstance(v, str):
+                continue
+            try:
+                row[k] = float(torch.as_tensor(v).reshape(-1)[0].cpu())
+            except Exception:
+                continue
+        return row
+
     def log(self, d, step):
+        flat = self._flat(d)
+        if self.csv_path:
+            os.makedirs(os.path.dirname(self.csv_path), exist_ok=True)
+            import csv
+            if self._csv_header is None:
+                self._csv_header = ["step"] + sorted(flat.keys())
+                with open(self.csv_path, "w", newline="") as f:
+                    csv.writer(f).writerow(self._csv_header)
+            with open(self.csv_path, "a", newline="") as f:
+                csv.writer(f).writerow([step] + [flat.get(k, "") for k in self._csv_header[1:]])
         if self.log_wandb:
             d["time/wall_time"] = self.wall_time
+            d["time/total_time"] = self.total_time
             wandb.log(d, step=step)
 
     def close(self):
@@ -660,7 +705,31 @@ if __name__ == "__main__":
                        tags=[args.wandb_group, args.agent_name, args.env_id, f"seed={args.seed}"])
     else:
         print("Running evaluation")
-    logger = Logger(log_wandb=(args.track and not args.evaluate))
+    logger = Logger(log_wandb=(args.track and not args.evaluate), run_dir=os.path.abspath(f"runs/{run_name}"))
+
+    # ── Resolved run config (local JSON: seeds, code revision, hardware) ──
+    def _git_rev():
+        try:
+            import subprocess
+            return subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=os.path.dirname(os.path.abspath(__file__))).decode().strip()
+        except Exception:
+            return "unknown"
+    import socket
+    eval_seed = args.eval_seed if args.eval_seed is not None else args.seed + 1000
+    resolved = dict(vars(args), eval_seed=eval_seed,
+                    env_horizon=max_episode_steps, n_obs=list(n_obs), n_state=int(n_state), n_act=int(n_act),
+                    git_rev=_git_rev(), hostname=socket.gethostname(),
+                    gpu_name=torch.cuda.get_device_name(device) if device.type == "cuda" else "cpu",
+                    torch_version=torch.__version__,
+                    cuda_version=torch.version.cuda if device.type == "cuda" else None)
+    # Policy-obs check: RGB + intended 12-dim robot state, no privileged task info.
+    # Flattened state must be exactly noisy_qpos(6)+target_qpos(6); anything else aborts.
+    assert int(n_state) == 12, f"policy state must be 12-dim (got {n_state}); privileged leak suspected"
+    os.makedirs(os.path.abspath(f"runs/{run_name}"), exist_ok=True)
+    with open(os.path.abspath(f"runs/{run_name}/config.json"), "w") as f:
+        import json
+        json.dump(resolved, f, indent=1, default=str)
+    print(f"Resolved config -> runs/{run_name}/config.json (train_seed={args.seed}, eval_seed={eval_seed}, horizon={max_episode_steps})")
 
     # ── Instantiate modules ────────────────────────────────────────────────
 
@@ -863,7 +932,9 @@ if __name__ == "__main__":
     # ── Training loop ──────────────────────────────────────────────────────
 
     obs, _ = envs.reset(seed=args.seed)
-    eval_envs.reset(seed=args.seed)
+    eval_envs.reset(seed=eval_seed)
+    setup_time = time.perf_counter() - logger.start_time
+    print(f"Setup time (env+model construction): {setup_time:.1f}s")
 
     global_step = 0
     pbar = tqdm.tqdm(total=args.total_timesteps, desc="steps")
@@ -871,6 +942,8 @@ if __name__ == "__main__":
     avg_returns = deque(maxlen=20)
     desc = ""
     d = {}
+    d["time/setup_time"] = setup_time
+    timed_out = False
 
     for iteration in range(args.num_total_iterations + 2):  # +2 for final eval
         # Evaluate
@@ -888,6 +961,13 @@ if __name__ == "__main__":
                     'global_step': global_step,
                 }, model_path)
                 print(f"Step {global_step}: model checkpoint saved to {model_path}")
+
+        # Explicit time-budget stopping (training time excludes eval).
+        if args.time_budget is not None and logger.wall_time >= args.time_budget and not args.evaluate:
+            print(f"Time budget {args.time_budget}s reached at step {global_step} "
+                  f"(wall {logger.wall_time:.0f}s, total {logger.total_time:.0f}s); final eval+save.")
+            timed_out = True
+            break
 
         # Collect
         if global_step < args.learning_starts:
@@ -957,15 +1037,39 @@ if __name__ == "__main__":
             max_ep_ret = max(infos["final_info"]["episode"]["return"][done_mask])
             avg_returns.extend(infos["final_info"]["episode"]["return"][done_mask])
             desc = f"global_step={global_step}, episodic_return={torch.tensor(avg_returns).mean(): 4.2f} (max={max_ep_ret: 4.2f})"
-            # Calculate wall_time metrics
-            sps = global_step / logger.wall_time
+            # Calculate wall_time metrics (wall excludes eval; total includes it)
+            sps = global_step / max(logger.wall_time, 1e-6)
             d["time/sps"] = sps
+            d["time/wall_time"] = logger.wall_time
+            d["time/total_time"] = logger.total_time
+            if device.type == "cuda":
+                d["time/gpu_mem_gb"] = torch.cuda.memory_allocated(device) / 1e9
+            d["task/episode_steps"] = float(max_episode_steps)
+            d["task/episode_seconds"] = float(max_episode_steps) / 10.0
             pbar.set_description(f"{sps: 4.4f} sps, " + desc)
             logger.log(d=d, step=global_step)
 
         # Increment counters
         pbar.update(args.num_envs)
         global_step += args.num_envs
+
+    # Final evaluation + guaranteed checkpoint (even between scheduled evals).
+    if not args.evaluate:
+        try:
+            evaluate(args, eval_envs, get_eval_action, logger, eval_output_dir,
+                     max_episode_steps, global_step, pbar)
+        except Exception as e:
+            print(f"Final evaluation failed: {e}")
+    if args.save_model and not args.evaluate:
+        torch.save({
+            'encoder': encoder.state_dict(),
+            'actor': actor.state_dict(),
+            'critic': critic_target.state_dict(),
+            'log_alpha': log_alpha,
+            'global_step': global_step,
+        }, model_path)
+        print(f"Final model checkpoint saved to {model_path} at step {global_step} "
+              f"(timed_out={timed_out}, wall={logger.wall_time:.0f}s, total={logger.total_time:.0f}s)")
 
     # Upload final checkpoint to wandb
     if args.save_model:

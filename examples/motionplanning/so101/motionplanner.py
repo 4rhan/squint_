@@ -77,9 +77,15 @@ class SO101GraspSolver:
         if self.delta_control:
             self._delta_limit = np.asarray(ctrl_cfg.upper, dtype=np.float64)
             self.MAX_JOINT_STEP = min(self.MAX_JOINT_STEP, 0.95 * float(self._delta_limit[:5].min()))
-            self.CONTINUITY_W, self.TILT_W, self.GRIP_SETTLE, self.SERVO_ITERS = 0.6, 1.0, 1, 2
+            # Keep IK branch weights tuned for delta, but use full settling/
+            # correction budget (same bounds as pos) so slow descents verify.
+            self.CONTINUITY_W, self.TILT_W, self.GRIP_SETTLE, self.SERVO_ITERS = 0.6, 1.0, 3, 4
             self.MAX_JOINT_ACCEL = self.MAX_JOINT_STEP  # full speed after one step
             self.APPROACH_H, self.LIFT_H, self.PLACE_APPROACH_H, self.RETREAT_H = 0.035, 0.035, 0.03, 0.04
+        self.fail_reason = None
+        self.n_clipped_steps = 0
+        self.n_steps = 0
+        self.last_place_err = None
         self.gripper_target = float(self.qpos()[5])
         self.half = None
         self._place_jaw_perp = None  # optional: keep the jaw normal perpendicular to this while placing
@@ -369,11 +375,15 @@ class SO101GraspSolver:
 
     def _step(self, arm_q, g):
         """Command absolute joint targets; in delta control this is converted to the normalised
-        target change (clipped to the controller limits, which rate-limits large gripper moves)."""
+        target change (clipped to the controller limits, which rate-limits large moves)."""
         action = np.concatenate([arm_q, [g]])
         if self.delta_control:
             current = self.base_env.agent.controller._target_qpos[0].cpu().numpy().astype(np.float64)
-            action = np.clip((action - current) / self._delta_limit, -1.0, 1.0)
+            raw = (action - current) / self._delta_limit
+            if bool((np.abs(raw) > 1.0 + 1e-9).any()):
+                self.n_clipped_steps += 1
+            action = np.clip(raw, -1.0, 1.0)
+        self.n_steps += 1
         self.last_step = self.env.step(action.astype(np.float32))
         if self.vis:
             self.base_env.render_human()
@@ -403,9 +413,10 @@ class SO101GraspSolver:
         for q, speed, g in self._pending:
             if np.max(np.abs(q - pts[-1])) > 1e-6:
                 pts.append(q)
-                # speed_scale < 1 (careful descents) never goes below 0.1 rad/step, which is already
-                # the full speed allowed in delta control
-                vmax.append(max(self.MAX_JOINT_STEP * speed, min(self.MAX_JOINT_STEP, 0.1)))
+                # speed_scale is effective in both modes (slow descents use
+                # MAX_JOINT_STEP*speed). MAX_JOINT_STEP itself already respects
+                # delta per-step limits, so no floor is applied.
+                vmax.append(self.MAX_JOINT_STEP * speed)
                 grip.append(g)
         last_g = self._pending[-1][2]
         self._pending = []
@@ -493,11 +504,13 @@ class SO101GraspSolver:
         self.gripper_target = g_open  # IK checks jaw clearance at this angle
         q_grasp = self.solve_ik(center, axes)
         if q_grasp is None:
+            self.fail_reason = "pick_ik"
             return False
         # Near the edge of the workspace the approach line may run out of
         # reach early; accept a shorter one (>= 1 cm) rather than failing.
         up = self.vertical_path(q_grasp, center, approach_height, axes)
         if len(up) < 2:
+            self.fail_reason = "pick_reach"
             return False
 
         self.queue(up[-1])
@@ -506,6 +519,8 @@ class SO101GraspSolver:
         self.hold(1)  # flushes: the arm comes to rest only here, just before closing
         self.set_gripper(self.g_squeeze)
         grasped = bool(self.agent.is_grasping(actor)[0])
+        if not grasped:
+            self.fail_reason = "pick_grasp"
         # Once held, the jaw orientation no longer matters much, so lift with
         # the held-object IK (cube kept near flat), which reaches further. The
         # lift is only queued, so it blends into the carry done by place().
@@ -536,6 +551,7 @@ class SO101GraspSolver:
                 break
         if q_place is None:
             self._place_jaw_perp = None
+            self.fail_reason = "place_ik"
             return False
         # a tilted cube's lowest corner sits below its center-minus-half-size
         tilt = self.held_tilt(q_place)
@@ -547,6 +563,7 @@ class SO101GraspSolver:
                 return False
         down = self.vertical_path(q_place, self.held_frame(q_place)[0], approach_height, face_axes, held=True)
         if len(down) < 2:
+            self.fail_reason = "place_reach"
             return False
 
         self.queue(down[-1])
@@ -563,21 +580,36 @@ class SO101GraspSolver:
         return True
 
     def _servo_held(self, actor, goal, face_axes, tol=0.003, iters=None):
-        """Closed-loop correction using the object's true pose: the PD arm sags
-        under the grasp, so shift the IK target by the observed error until the
-        held object is within tol of goal."""
+        """Closed-loop correction with verified tracking (bounded).
+
+        Shifts the IK target by observed error, drives toward each correction
+        with bounded substeps until commanded≈achieved (<8mrad) so clipped
+        delta targets cannot silently under-shoot, then settles before
+        re-measuring. Records final placement error for diagnostics.
+        """
         target = np.asarray(goal, dtype=np.float64).copy()
-        for _ in range(self.SERVO_ITERS if iters is None else iters):
+        n_iter = self.SERVO_ITERS if iters is None else iters
+        for _ in range(n_iter):
             err = actor.pose.sp.p - goal
-            if np.linalg.norm(err) < tol:
+            err_n = float(np.linalg.norm(err))
+            self.last_place_err = err_n
+            if err_n < tol:
                 break
             target -= err
             residuals, accept = self._held_problem(target, 2e-3, 40.0, face_axes)
             q = self._local_solve(residuals, accept, self._commanded_arm())
             if q is None:
+                self.fail_reason = "servo_ik"
                 break
-            self._step(q, self.gripper_target)
-            self.hold(1)
+            # Bounded drive to correction target (verify, don't assume).
+            for _sub in range(6):
+                cur = self._commanded_arm()
+                if float(np.max(np.abs(q - cur))) < 0.008:
+                    break
+                self._step(q, self.gripper_target)
+            self.hold(2)
+        err = actor.pose.sp.p - goal
+        self.last_place_err = float(np.linalg.norm(err))
 
     def _retreat_ik(self, q_from, gl_target):
         """Move gripper_link toward gl_target keeping its orientation close to

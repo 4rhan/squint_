@@ -1,0 +1,7 @@
+{
+ "env_id": "SO101Rearrange2-v1",
+ "seed": 100,
+ "controller": "pd_joint_target_delta_pos",
+ "horizon": 300,
+ "note": "live training-controller rollout; 128 render + area 16/32/64 actual policy inputs; 8px@128 ~= 1px@16, 2px@32, 4px@64"
+}

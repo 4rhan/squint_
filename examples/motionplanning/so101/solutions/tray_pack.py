@@ -2,8 +2,19 @@
 import numpy as np
 from examples.motionplanning.so101.motionplanner import SO101GraspSolver
 
+LAST_FAIL = {"stage": None, "reason": None, "solver": None, "cube": None}
+
+
+def _note(solver, stage, cube=None):
+    LAST_FAIL["stage"] = stage
+    LAST_FAIL["reason"] = solver.fail_reason
+    LAST_FAIL["cube"] = cube
+    LAST_FAIL["solver"] = {"clipped": solver.n_clipped_steps, "steps": solver.n_steps,
+                           "place_err": solver.last_place_err}
+
 
 def _solve_n(env, seed, vis, n):
+    LAST_FAIL.update(stage=None, reason=None, solver=None, cube=None)
     env.reset(seed=seed)
     solver = SO101GraspSolver(env, vis=vis)
     e = env.unwrapped
@@ -21,9 +32,11 @@ def _solve_n(env, seed, vis, n):
     for k in order:
         cube = e.cubes[k]
         if not solver.pick(cube, half, open_extra=0.015):
+            _note(solver, f"pick{k}", cube=k)
             return -1
         target = np.array([comp_x[k], tray_y, floor_z + half])
         if not solver.place(cube, target, (x_axis, y_axis), jaw_perp=row, release_gap=0.008):
+            _note(solver, f"place{k}", cube=k)
             return -1
         res = solver.last_step
     return solver.hold(12)

@@ -478,7 +478,7 @@ class SO101GraspSolver:
             axes.append(v / np.linalg.norm(v))
         return tuple(axes)
 
-    def pick(self, actor, half_size, approach_height=None, lift_height=None):
+    def pick(self, actor, half_size, approach_height=None, lift_height=None, open_extra=0.03):
         """Top-down grasp of a box-shaped actor, then lift straight up.
         Returns True if the actor is grasped after lifting."""
         approach_height = self.APPROACH_H if approach_height is None else approach_height
@@ -487,7 +487,7 @@ class SO101GraspSolver:
         center = actor.pose.sp.p.astype(np.float64)
         axes = self.horizontal_axes(actor)
         g_contact = self.gripper_qpos_for_gap(2 * half_size)
-        g_open = self.gripper_qpos_for_gap(2 * half_size + 0.03)
+        g_open = self.gripper_qpos_for_gap(2 * half_size + open_extra)
         self.g_squeeze = max(self.CLOSED, g_contact - self.SQUEEZE)
 
         self.gripper_target = g_open  # IK checks jaw clearance at this angle

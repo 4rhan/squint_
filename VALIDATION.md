@@ -69,18 +69,29 @@ hardware performance. No success check weakened; no favourable seeds selected
   original; no second camera, no privileged obs, no scripted camera moves.
 - Old teleport stills kept in `validation/wrist_vis/` (static checks).
 
-## 4. SQUINT baselines (run: pilot 1; pilots 2-5 in progress)
+## 4. SQUINT baselines (run: StackCube/Pack1/Pack3; Tower2/3 rerunning; Rearrange queued)
 - Pilot 1 `SO101StackCube-v1` seed 1 / eval 1001, 16×16, 1024 envs, 15-min
   training budget (wall excl. eval; total incl. eval logged): 2.79M steps,
   ~3300 sps, setup 1.7 s, buffer 1.55 GB. Final eval: success_at_end 0.94,
   success_once 1.00, return 38.3; grasp/on-top diagnostics 1.00.
   Reproduction check PASSES. Artifacts: `runs/pilot16_SO101StackCube-v1__s1/`
   (ckpt.pt, config.json, metrics.csv, curves.png, eval videos).
+- Pilot 2 `SO101TrayPack1-v1` same config: 2.79M steps. Final eval:
+  success_once 0.38, success_at_end 0.19, return 81.7; complete_once 0.75,
+  complete_stable_once 0.75. Honest PARTIAL result in 15 min (places 1 cube
+  reliably-ish, dwell rarely sustained). `validation/pilots/` archived.
+- Pilot 3 `SO101TrayPack3-v1` same config: 2.74M steps. Final eval:
+  success 0.00/0.00, return ~76, complete_once 0.00 (max_num_correct tracked).
+  Honest LEARNING FAILURE in 15 min — preserved as baseline, not tuned away.
+- Tower pilots first attempt CRASHED at env construction (1024 envs): corner
+  support broadcast bug (`(N,4)*(N,)`), invisible at N=1. Fixed (unsqueeze),
+  verified construct+step+dwell-guard at N=1024, rerunning Tower2/Tower3 pilots.
+  Lesson recorded: regression must cover N>1 construction (added).
 - Time-budget stop + final eval + guaranteed save verified (timed_out=True path).
 - Launcher: `examples/launch_squint_pilots.sh` (frozen order, seeds, 16×16;
   32/64 as separate labels only). No multi-seed sweep launched.
-- Pending this phase: Pack1, Pack3, Tower2, Tower3 pilots (queued), Rearrange
-  pilots after demo validation (env validated; demos 60%/20%).
+- Pending: Tower2, Tower3 (running), Rearrange2/3 pilots (env validated; demos
+  60%/20%) after towers.
 
 ## Findings table
 | class | finding | evidence |
@@ -90,6 +101,9 @@ hardware performance. No success check weakened; no favourable seeds selected
 | observation | 16 px marginal for far objects (7-11 px color blobs); near-field fine; final tower leaves FOV | live stats; no memory by design; 32/64 separate-label option |
 | runtime | old horizons too short after slower descents (Tower3 6× too_long at 200) | horizons extended with demo-mean justification; too_long 0 |
 | learning | StackCube reproduces (0.94/1.00 in 15 min) | pilot 1 curves + eval |
+| learning (partial) | Pack1 0.38 once / 0.19 at-end in 15 min | pilot 2 metrics |
+| learning (failure) | Pack3 0.00 in 15 min (2.74M steps) | pilot 3 metrics, untuned |
+| runtime (fixed) | tower corner broadcast crashed N=1024 construction; N=1 tests blind to it | fix + N=1024 construct/step regression |
 | learning (pending) | Pack/Tower/Rearrange pilots queued, not yet run | — |
 
 ## Remaining blockers / unrun

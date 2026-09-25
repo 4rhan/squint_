@@ -98,4 +98,5 @@ Thumbs.db
 *.temp
 *.bak
 
-
+# Old-format scripted-demo trials (absolute joint targets, no observations); QC demos live in demos/qc/
+demos/*/motionplanning/

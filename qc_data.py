@@ -12,7 +12,7 @@ directly from an env built exactly like the training env):
     traj_<i>/actions      (T, A)         float    in the env's action space (the training control mode,
                                                     by default normalised pd_joint_target_delta_pos in [-1, 1])
     traj_<i>/rewards      (T,)           float    same reward mode as training (normalized_dense)
-    traj_<i>/terminated   (T,)           bool     (optional, default all False)
+    traj_<i>/terminated   (T,)           bool     (optional; ignored unless use_terminations, see load_h5_demos)
     traj_<i>/truncated    (T,)           bool     (optional, default all False)
 """
 from typing import Optional
@@ -110,11 +110,15 @@ def _area_resize(rgb, size):
 
 
 def load_h5_demos(path, device, image_size, action_scale, action_bias, bootstrap_at_done="always",
-                  max_trajs: Optional[int] = None) -> ChunkBuffer:
+                  max_trajs: Optional[int] = None, use_terminations: bool = False) -> ChunkBuffer:
     """Load a ManiSkill-style .h5 demo file into a ChunkBuffer (E=1). See module docstring for the schema.
 
     Actions are mapped to [-1,1] via (a - bias) / scale, where scale/bias come from the env's action space.
     `bootstrap_at_done` mirrors train_squint's flag so demo `dones` follow the same convention as online data.
+    `use_terminations` must match how the online env treats terminations: with the default
+    ManiSkillVectorEnv(ignore_terminations=True) (partial_reset=False) success never ends an episode, so a
+    demo's `terminated` flags (often set on the last several steps, while success holds) are ignored and
+    the demo ends only at its last step. Honouring them would split each demo's tail into 1-step episodes.
     """
     scale = torch.as_tensor(action_scale, dtype=torch.float32, device=device)
     bias = torch.as_tensor(action_bias, dtype=torch.float32, device=device)
@@ -138,6 +142,8 @@ def load_h5_demos(path, device, image_size, action_scale, action_bias, bootstrap
             rew = torch.as_tensor(g["rewards"][:], dtype=torch.float32, device=device)
             term = torch.as_tensor(g["terminated"][:], device=device).bool() if "terminated" in g else torch.zeros(T, dtype=torch.bool, device=device)
             trunc = torch.as_tensor(g["truncated"][:], device=device).bool() if "truncated" in g else torch.zeros(T, dtype=torch.bool, device=device)
+            if not use_terminations:
+                term = torch.zeros_like(term)
             ep_end = torch.zeros(T, dtype=torch.bool, device=device)
             ep_end[-1] = True  # a demo always ends its episode at its last action
             ep_end |= term | trunc

@@ -42,8 +42,9 @@ class QCArgs(Args):
     50-step dense-reward tasks; the official QC's 0.99 targets long sparse-reward OGBench tasks."""
     tau: float = 0.01
     """target smoothing coefficient (Squint's value)"""
-    policy_frequency: int = 1
-    """unused by QC (actor + critic update together); kept so the base Args stay valid"""
+    policy_frequency: int = 4
+    """online: update the actor (flow BC + distillation + Q) every k critic updates, like Squint. The actor
+    step is most of the cost (10 flow integration passes); offline pretraining updates it every step."""
 
     demo_path: Optional[str] = None
     """HDF5 file with demonstrations (schema in qc_data.py). Required unless --offline_steps 0."""
@@ -67,29 +68,46 @@ class QCArgs(Args):
     alpha: float = 100.0
     """BC/distillation coefficient (tune per task)"""
     q_agg: str = "mean"
-    hidden_dim: int = 512
-    num_layers: int = 4
+    hidden_dim: int = 256
+    num_layers: int = 3
+    """actor/critic MLP size (Squint's; the official QC uses 512 x 4)"""
     lr: float = 3e-4
+
+    sim_backend: str = "gpu"
+    """'gpu' for real runs; 'cpu' (with --num-envs 1 --num-eval-envs 1) to smoke-test the script without a GPU"""
 
 
 class ChunkExecutor:
-    """Turns a chunk policy into a per-step get_action(rgb, state) closure: queries the agent every
-    `horizon` steps and replays the chunk open-loop in between (as in qc's main_online.py)."""
-
-    def __init__(self, agent, action_scale, action_bias, deterministic=False):
+    def __init__(self, agent, action_scale, action_bias, num_envs, deterministic=False):
         self.agent, self.scale, self.bias = agent, action_scale, action_bias
         self.deterministic = deterministic
-        self.chunk, self.i = None, 0
+        self.num_envs = num_envs
+        self.chunk = None  # [num_envs, h, n_act]
+        self.step_idx = torch.zeros(num_envs, dtype=torch.long, device=action_scale.device)
 
-    def reset(self):
-        self.chunk = None
+    def reset(self, env_mask=None):
+        if env_mask is None:
+            self.chunk = None
+            self.step_idx.zero_()
+        else:
+            # force those envs to re-query on the next call
+            self.step_idx[env_mask] = self.agent.cfg.horizon
 
     def __call__(self, rgb, state):
-        if self.chunk is None or self.i >= self.agent.cfg.horizon:
-            self.chunk, self.i = self.agent.act(rgb, state, deterministic=self.deterministic), 0
-        a = self.chunk[:, self.i]
-        self.i += 1
+        h = self.agent.cfg.horizon
+        if self.chunk is None:
+            self.chunk = self.agent.act(rgb, state, deterministic=self.deterministic)
+            self.step_idx.zero_()
+        else:
+            mask = self.step_idx >= h
+            if mask.any():
+                new_chunk = self.agent.act(rgb, state, deterministic=self.deterministic)
+                self.chunk[mask] = new_chunk[mask]
+                self.step_idx[mask] = 0
+        a = self.chunk[torch.arange(self.num_envs, device=rgb.device), self.step_idx]
+        self.step_idx += 1
         return a * self.scale + self.bias
+
 
 
 if __name__ == "__main__":
@@ -106,7 +124,7 @@ if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() and args.cuda else "cpu")
 
     # ── Environments (same construction as train_squint.py) ────────────────
-    env_kwargs = dict(obs_mode=args.obs_mode, render_mode=args.render_mode, sim_backend="gpu",
+    env_kwargs = dict(obs_mode=args.obs_mode, render_mode=args.render_mode, sim_backend=args.sim_backend,
                       sensor_configs=dict(width=args.render_size, height=args.render_size))
     eval_env_kwargs = dict(env_kwargs, human_render_camera_configs=dict(
         shader_pack="default", width=args.render_size, height=args.render_size))
@@ -114,7 +132,7 @@ if __name__ == "__main__":
         env_kwargs["control_mode"] = eval_env_kwargs["control_mode"] = args.control_mode
     if args.env_domain_randomization:
         env_kwargs["domain_randomization"] = eval_env_kwargs["domain_randomization"] = True
-    if args.stage2_start_prob > 0:
+    if getattr(args, 'stage2_start_prob', 0) > 0:
         env_kwargs["stage2_start_prob"] = args.stage2_start_prob
 
     train_envs = gym.make(args.env_id, num_envs=args.num_envs, reconfiguration_freq=args.reconfiguration_freq, **env_kwargs)
@@ -163,20 +181,32 @@ if __name__ == "__main__":
         ckpt = torch.load(args.checkpoint, map_location=device)
         agent.load_state_dicts(ckpt)
         print(f"Loaded checkpoint {args.checkpoint}")
-    executor = ChunkExecutor(agent, act_scale, act_bias)
-    # evaluation acts deterministically, like Squint's get_eval_action (training rollouts stay stochastic)
-    eval_executor = ChunkExecutor(agent, act_scale, act_bias, deterministic=True)
+    executor = ChunkExecutor(agent, act_scale, act_bias, num_envs=args.num_envs)
+    eval_executor = ChunkExecutor(agent, act_scale, act_bias, num_envs=args.num_eval_envs, deterministic=True)
+    if args.compile:
+        agent.update = torch.compile(agent.update)
+    # don't compile the executors yet — the per-env masking has dynamic shapes;
+    # compile with dynamic=True if you want to try it later
 
     # Demo frames are stored clean; online frames come out of ColorJitterWrapper already jittered.
     # Apply the same per-observation jitter to every demo batch so both sources match.
+    # Re-jittering the whole (small) demo image store once per env-step iteration costs 2 jitter calls;
+    # jittering every sampled batch cost 2 * num_updates calls per iteration, mostly in the hue step.
     demo_jitter = torchvision.transforms.ColorJitter(0.3, 0.3, 0.3, 0.05)  # = utils.ColorJitterWrapper
+    demo_clean = {}
+
+    def rejitter_demos():
+        if offline is None or not args.apply_jitter:
+            return
+        for key in ("rgb", "next_rgb"):
+            store = getattr(offline, key)
+            if key not in demo_clean:
+                demo_clean[key] = store.clone()
+            clean = demo_clean[key]
+            store.copy_(color_jitter(clean.view(-1, *clean.shape[2:]), demo_jitter).view_as(clean))
 
     def sample_offline(n):
-        b = offline.sample(n, cfg.horizon, cfg.gamma)
-        if args.apply_jitter:
-            for key in ("rgb", "next_rgb"):
-                b[key] = color_jitter(b[key], demo_jitter)
-        return b
+        return offline.sample(n, cfg.horizon, cfg.gamma)
 
     def save(step):
         if args.save_model:
@@ -186,11 +216,16 @@ if __name__ == "__main__":
     offline = None
     if args.demo_path:
         offline = load_h5_demos(args.demo_path, device, args.image_size, act_scale, act_bias,
-                                bootstrap_at_done=args.bootstrap_at_done, max_trajs=args.max_demo_trajs)
+                                bootstrap_at_done=args.bootstrap_at_done, max_trajs=args.max_demo_trajs,
+                                use_terminations=args.partial_reset)  # same rule as the online vector env
         assert offline.rgb.shape[2:] == n_obs and offline.state.shape[-1] == n_state, (
             f"demo obs {tuple(offline.rgb.shape[2:])}/{offline.state.shape[-1]} do not match env {n_obs}/{n_state}")
+    if max_episode_steps % cfg.horizon:
+        print(f"[warn] env horizon {max_episode_steps} is not divisible by the chunk length {cfg.horizon}")
     if args.offline_steps > 0 and not args.checkpoint:
         for step in tqdm.trange(args.offline_steps, desc="offline pretrain"):
+            if step % args.num_updates == 0:
+                rejitter_demos()
             info = agent.update(sample_offline(args.batch_size))
             if step % 1000 == 0:
                 logger.log({f"offline/{k}": v.item() for k, v in info.items()}, step=step)
@@ -219,6 +254,7 @@ if __name__ == "__main__":
     global_step, d = 0, {}
     avg_returns = deque(maxlen=20)
     pbar = tqdm.tqdm(total=args.total_timesteps, desc="steps")
+    offline_wall = logger.wall_time  # so sps below counts only the online phase
 
     for iteration in range(args.num_total_iterations + 2):
         if args.eval_freq > 0 and ((global_step - args.num_envs) // args.eval_freq) < (global_step // args.eval_freq):
@@ -245,11 +281,15 @@ if __name__ == "__main__":
         rb.add(obs['rgb'], obs['state'], real_next['rgb'], real_next['state'], norm_action, rewards, dones, ep_end)
         obs = next_obs
         if ep_end.any():
-            executor.reset()  # a new episode started -> discard the remaining open-loop chunk
+            executor.reset(env_mask=ep_end) # a new episode started -> discard the remaining open-loop chunk
 
         if global_step > args.learning_starts and rb.size >= cfg.horizon:
-            for _ in range(args.num_updates):
-                info = agent.update(sample_batch())
+            rejitter_demos()
+            info = {}
+            for grad_step in range(args.num_updates):
+                # update() steps the actor only every policy_frequency-th call; keep the newest value of every
+                # key so the actor losses are not lost when the last call of the loop is critic-only
+                info.update(agent.update(sample_batch(), update_actor=grad_step % args.policy_frequency == 0))
             d.update({f"train_rl/{k}": v for k, v in info.items()})
 
         if "final_info" in infos:
@@ -257,7 +297,7 @@ if __name__ == "__main__":
             for k, v in infos["final_info"]["episode"].items():
                 d[f"train/{k}"] = v[done_mask].float().mean()
             avg_returns.extend(infos["final_info"]["episode"]["return"][done_mask].tolist())
-            sps = global_step / max(logger.wall_time, 1e-6)
+            sps = global_step / max(logger.wall_time - offline_wall, 1e-6)
             d["time/sps"] = sps
             pbar.set_description(f"{sps:.1f} sps, step={global_step}, return={np.mean(avg_returns):.2f}")
             logger.log(d={k: (v.item() if torch.is_tensor(v) else v) for k, v in d.items()}, step=log_off + global_step)

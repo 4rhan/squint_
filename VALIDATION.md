@@ -69,41 +69,37 @@ hardware performance. No success check weakened; no favourable seeds selected
   original; no second camera, no privileged obs, no scripted camera moves.
 - Old teleport stills kept in `validation/wrist_vis/` (static checks).
 
-## 4. SQUINT baselines (run: StackCube/Pack1/Pack3; Tower2/3 rerunning; Rearrange queued)
-- Pilot 1 `SO101StackCube-v1` seed 1 / eval 1001, 16×16, 1024 envs, 15-min
-  training budget (wall excl. eval; total incl. eval logged): 2.79M steps,
-  ~3300 sps, setup 1.7 s, buffer 1.55 GB. Final eval: success_at_end 0.94,
-  success_once 1.00, return 38.3; grasp/on-top diagnostics 1.00.
-  Reproduction check PASSES. Artifacts: `runs/pilot16_SO101StackCube-v1__s1/`
-  (ckpt.pt, config.json, metrics.csv, curves.png, eval videos).
-- Pilot 2 `SO101TrayPack1-v1` same config: 2.79M steps. Final eval:
-  success_once 0.38, success_at_end 0.19, return 81.7; complete_once 0.75,
-  complete_stable_once 0.75. Honest PARTIAL result in 15 min (places 1 cube
-  reliably-ish, dwell rarely sustained). `validation/pilots/` archived.
-- Pilot 3 `SO101TrayPack3-v1` same config: 2.74M steps. Final eval:
-  success 0.00/0.00, return ~76, complete_once 0.00 (max_num_correct tracked).
-  Honest LEARNING FAILURE in 15 min — preserved as baseline, not tuned away.
-- Tower pilots first attempt CRASHED at env construction (1024 envs): corner
-  support broadcast bug (`(N,4)*(N,)`), invisible at N=1. Fixed (unsqueeze),
-  verified construct+step+dwell-guard at N=1024, reran clean:
-  Tower2 final eval success 0.00/0.00, base_placed_once 1.00,
-  medium_supported_once 0.00 (2.92M steps); Tower3 success 0.00/0.00,
-  base_placed_once 0.88→1.00, medium_supported 0.00 (2.87M steps). Honest
-  PARTIAL results: policies reliably move the base to the marked tower but do
-  not stack within 15 min — preserved as baseline, not tuned.
-  `validation/pilots/` archived.
-- Time-budget stop + final eval + guaranteed save verified (timed_out=True path).
-- Launcher: `examples/launch_squint_pilots.sh` (frozen order, seeds, 16×16;
-  32/64 as separate labels only). No multi-seed sweep launched.
-- Pending: Tower2, Tower3 (running), Rearrange2/3 pilots (env validated; demos
-  60%/20%) after towers.
+## 4. SQUINT baselines (all 7 pilots run, seed 1 / eval 1001, 16×16, 1024 envs,
+15-min training budget = wall excl. eval; totals incl. eval logged)
+| pilot | steps | success_once / at_end | partial diagnostics |
+|---|---|---|---|
+| StackCube (repro) | 2.79M | 1.00 / 0.94 | grasp 1.00, on-top 1.00 — PASSES |
+| Pack1 | 2.79M | 0.38 / 0.19 | complete 0.75 — partial |
+| Pack3 | 2.74M | 0.00 / 0.00 | complete 0.00 — failure |
+| Tower2 | 2.92M | 0.00 / 0.00 | base 1.00, medium 0.00 — partial |
+| Tower3 | 2.87M | 0.00 / 0.00 | base ~1.00, medium 0.00 — partial |
+| Rearrange2 | 2.58M | 0.00 / 0.00 | complete 0.00, buffer always empty — failure |
+| Rearrange3 | 2.53M | 0.00 / 0.00 | complete 0.00 — failure |
+Artifacts per pilot in `validation/pilots/pilot16_<env>__s1/` (curves.png,
+config.json with seeds/revision/hardware, metrics.csv, eval_latest.mp4);
+checkpoints in `runs/` (local only, git-ignored).
+Only the original short task learns in-budget; every longer task shows
+zero-or-partial with stage diagnostics pinpointing the stall (Pack1: place
+yes/dwell rarely; Towers: base yes/stack no; Pack3/Rearrange: nothing).
+Preserved untuned — any later tuning separately documented.
+- Rearrange3 first attempt died silently ~400k steps, no traceback; rerun ran
+  28 min clean to budget. Transient runtime event, non-repeating — recorded,
+  not interpreted as learning signal.
+- Time-budget stop + final eval + guaranteed save verified on all 7 runs.
+- Launcher: `examples/launch_squint_pilots.sh` (frozen order/seeds/16×16;
+  32/64 as separate labels only). No multi-seed sweep launched (single-seed
+  pilots are not final evidence).
 - Rearrange2 pilot: 2.58M steps, final eval success 0.00/0.00, complete 0.00,
   buffer_empty 1.00 (buffer starts empty and policy never moves cubes there —
   earliest-stage failure), max_num_correct tracked. Honest failure.
-- Rearrange3 pilot first attempt DIED silently at ~400k steps / 4 min wall with
-  no traceback (env constructed and trained fine until then; 3-pocket sibling
-  ran 24 min clean). Rerunning to test reproducibility; if it recurs, suspect
-  4-pocket PhysX/GPU interaction — recorded as runtime failure, not learning.
+- Rearrange3 pilot first attempt died silently ~400k steps / 4 min wall, no
+  traceback; rerun ran 28 min clean to budget (2.53M steps, success 0.00).
+  Transient runtime event, non-repeating — recorded, not a learning signal.
 
 ## Findings table
 | class | finding | evidence |
@@ -114,14 +110,13 @@ hardware performance. No success check weakened; no favourable seeds selected
 | runtime | old horizons too short after slower descents (Tower3 6× too_long at 200) | horizons extended with demo-mean justification; too_long 0 |
 | learning | StackCube reproduces (0.94/1.00 in 15 min) | pilot 1 curves + eval |
 | learning (partial) | Pack1 0.38 once / 0.19 at-end; Tower2/3 base_placed ~1.00 but stacking 0.00, all in 15 min | pilot metrics |
-| learning (failure) | Pack3 0.00 (2.74M), Rearrange2 0.00 (2.58M) in 15 min | pilot metrics, untuned |
-| runtime | Rearrange3 pilot died silently ~400k steps, no traceback (rerun pending) | pilot log |
+| learning (failure) | Pack3, Rearrange2, Rearrange3 all 0.00 in 15 min (2.5-2.7M steps each) | pilot metrics, untuned |
+| runtime (transient) | Rearrange3 pilot died silently ~400k steps once; rerun clean 28 min | pilot logs; non-repeating |
 | runtime (fixed) | tower corner broadcast crashed N=1024 construction; N=1 tests blind to it | fix + N=1024 construct/step regression |
-| learning (pending) | Pack/Tower/Rearrange pilots queued, not yet run | — |
 
 ## Remaining blockers / unrun
-1. Pilots 2-6 (Pack1/Pack3/Tower2/Tower3 + Rearrange once through): queued after
-   pilot 1; multi-seed repeats not launched (launcher provided).
+1. Multi-seed repeats (launcher provided) and 32/64 resolution diagnostics: not
+   launched — single-seed pilots are not final evidence.
 2. Rearrange3 demo yield 20% (pick_grasp in pockets dominates): bulk collection
    needs ~100 attempts/20 demos; further gains via pocket-pick alignment or
    slightly larger pockets (would refreeze geometry — not done here).

@@ -26,7 +26,7 @@ class Place3RandomizationConfig(DefaultRandomizationConfig):
     """Domain randomization config for the 3-cube Place task."""
     # Noisy joint positions for better sim2real
     robot_qpos_noise_std: float = np.deg2rad(5)
-    cube_half_size_range: Sequence[float] = (0.022 / 2, 0.028 / 2)
+    cube_half_size_range: Sequence[float] = (0.0125, 0.0125)  # fixed 25 mm cubes (the size never varies)
     # Bin randomization (half sizes) - same ranges as the single-item Place task
     bin_half_size_x_range: Sequence[float] = (0.07 / 2, 0.09 / 2)
     bin_half_size_y_range: Sequence[float] = (0.09 / 2, 0.11 / 2)

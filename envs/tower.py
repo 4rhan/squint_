@@ -412,7 +412,8 @@ class TowerBase(DefaultCameraEnv):
         ], dim=1) + (p_top[:, :2].unsqueeze(1))
         # into bottom frame
         rel = corners - p_bot[:, :2].unsqueeze(1)
-        cb, sb = torch.cos(-yaw_bot), torch.sin(-yaw_bot)
+        cb = torch.cos(-yaw_bot).unsqueeze(1)
+        sb = torch.sin(-yaw_bot).unsqueeze(1)
         lx = rel[:, :, 0] * cb - rel[:, :, 1] * sb
         ly = rel[:, :, 0] * sb + rel[:, :, 1] * cb
         margin = 0.002

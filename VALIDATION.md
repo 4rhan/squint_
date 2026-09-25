@@ -85,8 +85,13 @@ hardware performance. No success check weakened; no favourable seeds selected
   Honest LEARNING FAILURE in 15 min — preserved as baseline, not tuned away.
 - Tower pilots first attempt CRASHED at env construction (1024 envs): corner
   support broadcast bug (`(N,4)*(N,)`), invisible at N=1. Fixed (unsqueeze),
-  verified construct+step+dwell-guard at N=1024, rerunning Tower2/Tower3 pilots.
-  Lesson recorded: regression must cover N>1 construction (added).
+  verified construct+step+dwell-guard at N=1024, reran clean:
+  Tower2 final eval success 0.00/0.00, base_placed_once 1.00,
+  medium_supported_once 0.00 (2.92M steps); Tower3 success 0.00/0.00,
+  base_placed_once 0.88→1.00, medium_supported 0.00 (2.87M steps). Honest
+  PARTIAL results: policies reliably move the base to the marked tower but do
+  not stack within 15 min — preserved as baseline, not tuned.
+  `validation/pilots/` archived.
 - Time-budget stop + final eval + guaranteed save verified (timed_out=True path).
 - Launcher: `examples/launch_squint_pilots.sh` (frozen order, seeds, 16×16;
   32/64 as separate labels only). No multi-seed sweep launched.
@@ -101,7 +106,7 @@ hardware performance. No success check weakened; no favourable seeds selected
 | observation | 16 px marginal for far objects (7-11 px color blobs); near-field fine; final tower leaves FOV | live stats; no memory by design; 32/64 separate-label option |
 | runtime | old horizons too short after slower descents (Tower3 6× too_long at 200) | horizons extended with demo-mean justification; too_long 0 |
 | learning | StackCube reproduces (0.94/1.00 in 15 min) | pilot 1 curves + eval |
-| learning (partial) | Pack1 0.38 once / 0.19 at-end in 15 min | pilot 2 metrics |
+| learning (partial) | Pack1 0.38 once / 0.19 at-end; Tower2/3 base_placed ~1.00 but stacking 0.00, all in 15 min | pilot metrics |
 | learning (failure) | Pack3 0.00 in 15 min (2.74M steps) | pilot 3 metrics, untuned |
 | runtime (fixed) | tower corner broadcast crashed N=1024 construction; N=1 tests blind to it | fix + N=1024 construct/step regression |
 | learning (pending) | Pack/Tower/Rearrange pilots queued, not yet run | — |

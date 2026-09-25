@@ -12,6 +12,8 @@ Output (one group per successful episode):
     traj_<i>/obs/state  (T+1, S)       float32
     traj_<i>/actions    (T, A)         float32   normalised env actions
     traj_<i>/rewards    (T,)           float32   normalized_dense
+    traj_<i>/terminated (T,) bool, traj_<i>/truncated (T,) bool (True on the last step)
+    traj_<i>/obs/full_state (T+1, D) float32   privileged state (layout in the traj's full_state_layout attr)
     traj_<i>/gt/...     privileged ground-truth values from the simulator (ignored by the loader):
         tcp_pose (T+1,7) end-effector pose [xyz, quat wxyz], qpos/qvel (T+1,J), per-object poses
         (place3: cube_pose (T+1,3,7), bin_pose (T+1,7); stack/lift: item*_pose (T+1,7)), static sizes
@@ -93,7 +95,7 @@ class EpisodeRecorder(gym.Wrapper):
     def reset(self, **kwargs):
         obs, info = self.env.reset(**kwargs)
         self.rgb, self.state = [self._rgb(obs)], [self._state(obs)]
-        self.actions, self.rewards = [], []
+        self.actions, self.rewards, self.terminated = [], [], []
         base = self.env.unwrapped
         self.gt = {k: [v] for k, v in gt_state(base).items()}
         self.gt_flags = {"success": [], "num_in_bin": []}
@@ -106,6 +108,7 @@ class EpisodeRecorder(gym.Wrapper):
         self.state.append(self._state(obs))
         self.actions.append(np.asarray(action, dtype=np.float32).reshape(-1))
         self.rewards.append(float(torch.as_tensor(reward).reshape(-1)[0]))
+        self.terminated.append(bool(torch.as_tensor(terminated).reshape(-1)[0]))
         for k, v in gt_state(self.env.unwrapped).items():
             self.gt[k].append(v)
         for k in self.gt_flags:
@@ -156,6 +159,9 @@ def parse_args():
     p.add_argument("--max-attempts", type=int, default=None, help="give up after this many episodes")
     p.add_argument("--keep-long", action="store_true", help="keep successful demos longer than the env horizon")
     p.add_argument("--vis", action="store_true")
+    p.add_argument("--replay-from", default=None,
+                   help="re-record the demos of this .h5 (same seeds and actions) with the current --obs-mode")
+    p.add_argument("--shard", default="0/1", help="with --replay-from, process demos k, k+N, ... as 'k/N' (parallel runs)")
     # must match the training run (train_squint.Args defaults)
     p.add_argument("--obs-mode", default="rgb+segmentation")
     p.add_argument("--control-mode", default=None, help="None = env default (pd_joint_target_delta_pos)")
@@ -169,11 +175,69 @@ def parse_args():
     return p.parse_args()
 
 
+def write_episode(f, idx, env, seed):
+    """Write the episode held by the recorder as group traj_<idx>."""
+    g = f.create_group(f"traj_{idx}")
+    g.create_dataset("obs/rgb", data=np.stack(env.rgb), compression="gzip")
+    g.create_dataset("obs/state", data=np.stack(env.state))
+    g.create_dataset("actions", data=np.stack(env.actions))
+    g.create_dataset("rewards", data=np.asarray(env.rewards, dtype=np.float32))
+    T = len(env.actions)
+    trunc = np.zeros(T, dtype=bool)
+    trunc[-1] = True  # a demo is cut off at its last step
+    g.create_dataset("terminated", data=np.asarray(env.terminated, dtype=bool))
+    g.create_dataset("truncated", data=trunc)
+    # full privileged state as an observation (T+1, D): joints, tcp, every object pose, object sizes
+    parts = [np.stack(env.gt[k]).reshape(T + 1, -1) for k in sorted(env.gt)]
+    parts += [np.tile(v.reshape(1, -1), (T + 1, 1)) for _, v in sorted(env.gt_const.items())]
+    g.create_dataset("obs/full_state", data=np.concatenate(parts, 1).astype(np.float32))
+    g.attrs["full_state_layout"] = json.dumps({k: int(np.stack(env.gt[k]).reshape(T + 1, -1).shape[1]) for k in sorted(env.gt)}
+                                              | {k: int(v.size) for k, v in sorted(env.gt_const.items())})
+    gt = g.create_group("gt")
+    for k, v in env.gt.items():
+        gt.create_dataset(k, data=np.stack(v))
+    for k, v in env.gt_flags.items():
+        if v:
+            gt.create_dataset(k, data=np.asarray(v, dtype=np.float32))
+    for k, v in env.gt_const.items():
+        gt.create_dataset(k, data=v)
+    dpos, drot = eef_deltas(np.stack(env.gt["tcp_pose"]))
+    gt.create_dataset("tcp_delta_pos", data=dpos)
+    gt.create_dataset("tcp_delta_rotvec", data=drot)
+    g.attrs["seed"] = seed
+
+
+def replay_main(args, env, horizon, out):
+    """Re-record the demos of args.replay_from (same seeds, same actions) with the current observation
+    settings, e.g. --obs-mode rgb+segmentation+state to add the privileged simulator state. The simulator is
+    deterministic, so each replay reproduces its demo exactly; no solver is run."""
+    k_shard, n_shard = (int(x) for x in args.shard.split("/"))
+    saved = 0
+    with h5py.File(args.replay_from, "r") as src, h5py.File(out, "w") as f:
+        keys = sorted((k for k in src if k.startswith("traj_")), key=lambda k: int(k.split("_")[1]))[k_shard::n_shard]
+        f.attrs["meta"] = json.dumps(dict(vars(args), horizon=horizon, control_mode=env.unwrapped.control_mode))
+        for k in tqdm(keys):
+            seed, actions = int(src[k].attrs["seed"]), src[k]["actions"][:]
+            env.reset(seed=seed)
+            info = {}
+            for a in actions:
+                _, _, _, _, info = env.step(a)
+            if not bool(info["success"].reshape(-1)[0]):
+                print(f"[{k} seed {seed}] replay did not end in success; skipped")
+                continue
+            write_episode(f, saved, env, seed)
+            saved += 1
+    env.close()
+    print(f"Re-recorded {saved}/{len(keys)} demos from {args.replay_from} to {out} (obs_mode {args.obs_mode}).")
+
+
 def main(args):
     solve = importlib.import_module(f"examples.motionplanning.so101.solutions.{SOLUTIONS[args.env_id]}").solve
     env, horizon = make_env(args)
     out = args.out or f"demos/qc/{args.env_id}.h5"
     os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)
+    if args.replay_from:
+        return replay_main(args, env, horizon, out)
 
     saved = attempts = too_long = 0
     lengths = []
@@ -196,23 +260,7 @@ def main(args):
             if T > horizon and not args.keep_long:
                 too_long += 1
                 continue
-            g = f.create_group(f"traj_{saved}")
-            g.create_dataset("obs/rgb", data=np.stack(env.rgb), compression="gzip")
-            g.create_dataset("obs/state", data=np.stack(env.state))
-            g.create_dataset("actions", data=np.stack(env.actions))
-            g.create_dataset("rewards", data=np.asarray(env.rewards, dtype=np.float32))
-            gt = g.create_group("gt")
-            for k, v in env.gt.items():
-                gt.create_dataset(k, data=np.stack(v))
-            for k, v in env.gt_flags.items():
-                if v:
-                    gt.create_dataset(k, data=np.asarray(v, dtype=np.float32))
-            for k, v in env.gt_const.items():
-                gt.create_dataset(k, data=v)
-            dpos, drot = eef_deltas(np.stack(env.gt["tcp_pose"]))
-            gt.create_dataset("tcp_delta_pos", data=dpos)
-            gt.create_dataset("tcp_delta_rotvec", data=drot)
-            g.attrs["seed"] = seed - 1
+            write_episode(f, saved, env, seed - 1)
             lengths.append(T)
             saved += 1
             pbar.update(1)

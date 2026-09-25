@@ -19,6 +19,7 @@ obs layout, reward mode). Episode boundaries via groups + term/trunc (T+1 obs).
 Usage:
   python -m examples.collect_new_tasks_demos -e SO101Tower3Cube-v1 -n 10 -o demos/qc/SO101Tower3Cube-v1.h5
   python -m examples.collect_new_tasks_demos --all -n 5 --outdir demos/qc
+  python -m examples.collect_new_tasks_demos -e SO101TrayPack3-v1 -n 100 --workers 16 -o demos/qc/SO101TrayPack3-v1.h5
   python -m examples.collect_new_tasks_demos -e SO101Rearrange3-v1 -n 20 --start-seed 100 --domain-randomization -o demos/qc/rearr3.h5
 """
 import argparse
@@ -101,7 +102,7 @@ def load_solver(env_id):
 
 
 def collect_one(env_id, num_traj, out, start_seed=0, max_attempts=None, render_size=128,
-                domain_randomization=False, control_mode=None):
+                domain_randomization=False, control_mode=None, seed_step=1, position=0):
     solve = load_solver(env_id)
     sol_mod = importlib.import_module(SOLVER_MODULES[env_id])
     env, horizon, actual_dr, actual_ctrl = make_env(
@@ -125,7 +126,7 @@ def collect_one(env_id, num_traj, out, start_seed=0, max_attempts=None, render_s
     lengths = []
     fail_cats = Counter()
     seed = start_seed
-    pbar = tqdm(total=num_traj, desc=env_id)
+    pbar = tqdm(total=num_traj, desc=env_id if seed_step == 1 else f"{env_id}[{position}]", position=position)
     with h5py.File(out, "w") as f:
         meta = dict(env_id=env_id, horizon=horizon, render_size=render_size,
                     obs_mode="rgb+segmentation", reward_mode="normalized_dense",
@@ -150,7 +151,7 @@ def collect_one(env_id, num_traj, out, start_seed=0, max_attempts=None, render_s
                 res = -1
                 fail_stage, fail_reason = "exception", str(err)[:80]
             cur_seed = seed
-            seed += 1
+            seed += seed_step
             if res == -1:
                 fail_cats[f"plan_fail:{fail_stage}:{fail_reason}"] += 1
                 continue
@@ -191,6 +192,40 @@ def collect_one(env_id, num_traj, out, start_seed=0, max_attempts=None, render_s
     return out
 
 
+def _worker(kw):
+    torch.set_num_threads(1)  # one core per worker; torch's own thread pool would oversubscribe
+    return collect_one(**kw)
+
+
+def collect_parallel(env_id, num_traj, out, workers, start_seed=0, max_attempts=None, **kw):
+    """Split collection over `workers` processes (seeds interleaved: worker w runs
+    start_seed+w, +workers, ...), then merge the shards into `out` in seed order.
+    Sim, rendering and IK are all single-threaded CPU work, so this scales with cores."""
+    import multiprocessing as mp
+    per = -(-num_traj // workers)
+    per_attempts = None if max_attempts is None else -(-max_attempts // workers)
+    shards = [f"{out}.part{w}" for w in range(workers)]
+    jobs = [dict(env_id=env_id, num_traj=per, out=shards[w], start_seed=start_seed + w, max_attempts=per_attempts,
+                 seed_step=workers, position=w, **kw) for w in range(workers)]
+    with mp.get_context("spawn").Pool(workers) as pool:
+        pool.map(_worker, jobs)
+    trajs, meta = [], None
+    for sh in shards:
+        with h5py.File(sh, "r") as f:
+            meta = meta or f.attrs["meta"]
+            trajs += [(int(f[k].attrs["seed"]), sh, k) for k in f.keys()]
+    trajs.sort()
+    with h5py.File(out, "w") as dst:
+        dst.attrs["meta"] = meta
+        for i, (_, sh, k) in enumerate(trajs[:num_traj]):
+            with h5py.File(sh, "r") as src:
+                src.copy(src[k], dst, name=f"traj_{i}")
+    for sh in shards:
+        os.remove(sh)
+    print(f"[{env_id}] merged {min(len(trajs), num_traj)} trajectories from {workers} workers -> {out}")
+    return out
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("-e", "--env-id", default=None, choices=sorted(SOLVERS))
@@ -201,6 +236,8 @@ def main():
     p.add_argument("--start-seed", type=int, default=0)
     p.add_argument("--max-attempts", type=int, default=200)
     p.add_argument("--render-size", type=int, default=128)
+    p.add_argument("--workers", type=int, default=1,
+                   help="parallel collector processes (about one per free CPU core)")
     p.add_argument("--domain-randomization", action="store_true",
                    help="explicitly enable domain randomization (default off)")
     p.add_argument("--control-mode", default=None,
@@ -209,6 +246,11 @@ def main():
     ids = sorted(SOLVERS) if args.all else [args.env_id or "SO101Tower3Cube-v1"]
     for eid in ids:
         out = args.out if (args.out and not args.all) else f"{args.outdir}/{eid}.h5"
+        if args.workers > 1:
+            collect_parallel(eid, args.num_traj, out, args.workers, start_seed=args.start_seed,
+                             max_attempts=args.max_attempts, render_size=args.render_size,
+                             domain_randomization=args.domain_randomization, control_mode=args.control_mode)
+            continue
         collect_one(eid, args.num_traj, out, start_seed=args.start_seed,
                     max_attempts=args.max_attempts, render_size=args.render_size,
                     domain_randomization=args.domain_randomization,

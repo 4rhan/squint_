@@ -97,6 +97,13 @@ hardware performance. No success check weakened; no favourable seeds selected
   32/64 as separate labels only). No multi-seed sweep launched.
 - Pending: Tower2, Tower3 (running), Rearrange2/3 pilots (env validated; demos
   60%/20%) after towers.
+- Rearrange2 pilot: 2.58M steps, final eval success 0.00/0.00, complete 0.00,
+  buffer_empty 1.00 (buffer starts empty and policy never moves cubes there —
+  earliest-stage failure), max_num_correct tracked. Honest failure.
+- Rearrange3 pilot first attempt DIED silently at ~400k steps / 4 min wall with
+  no traceback (env constructed and trained fine until then; 3-pocket sibling
+  ran 24 min clean). Rerunning to test reproducibility; if it recurs, suspect
+  4-pocket PhysX/GPU interaction — recorded as runtime failure, not learning.
 
 ## Findings table
 | class | finding | evidence |
@@ -107,7 +114,8 @@ hardware performance. No success check weakened; no favourable seeds selected
 | runtime | old horizons too short after slower descents (Tower3 6× too_long at 200) | horizons extended with demo-mean justification; too_long 0 |
 | learning | StackCube reproduces (0.94/1.00 in 15 min) | pilot 1 curves + eval |
 | learning (partial) | Pack1 0.38 once / 0.19 at-end; Tower2/3 base_placed ~1.00 but stacking 0.00, all in 15 min | pilot metrics |
-| learning (failure) | Pack3 0.00 in 15 min (2.74M steps) | pilot 3 metrics, untuned |
+| learning (failure) | Pack3 0.00 (2.74M), Rearrange2 0.00 (2.58M) in 15 min | pilot metrics, untuned |
+| runtime | Rearrange3 pilot died silently ~400k steps, no traceback (rerun pending) | pilot log |
 | runtime (fixed) | tower corner broadcast crashed N=1024 construction; N=1 tests blind to it | fix + N=1024 construct/step regression |
 | learning (pending) | Pack/Tower/Rearrange pilots queued, not yet run | — |
 

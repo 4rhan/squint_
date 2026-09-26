@@ -37,10 +37,16 @@ COLORS3 = [np.array([1, 0, 0, 1]), np.array([0, 1, 0, 1]), np.array([0, 0, 1, 1]
 NEUTRAL = np.array([0.85, 0.85, 0.85, 1])
 
 
+def _yaw_from_quat(q: torch.Tensor) -> torch.Tensor:
+    w, x, y, z = q[..., 0], q[..., 1], q[..., 2], q[..., 3]
+    return torch.atan2(2 * (w * z + x * y), 1 - 2 * (y * y + z * z))
+
+
 @dataclass
 class RearrangeRandomizationConfig(DefaultRandomizationConfig):
     robot_qpos_noise_std: float = np.deg2rad(5)
-    cube_half_size_range: Sequence[float] = (0.011, 0.013)
+    # 20-24 mm sides, max rotated 33.9mm < 42mm pocket inner.
+    cube_half_size_range: Sequence[float] = (0.010, 0.012)
     item_friction_range: Sequence[float] = (0.1, 0.5)
     item_density_range: Sequence[float] = (200, 200)
     randomize_item_color: bool = False
@@ -59,12 +65,14 @@ class RearrangeBase(DefaultCameraEnv):
         self, *args, robot_uids="so101", control_mode="pd_joint_target_delta_pos",
         domain_randomization_config: Union[RearrangeRandomizationConfig, dict] = RearrangeRandomizationConfig(),
         domain_randomization=False,
-        # Pocket geometry (configurable, printable).
-        pocket_inner: float = 0.036, pocket_wall_t: float = 0.005,
-        pocket_wall_h: float = 0.012, pocket_floor_t: float = 0.005,
+        # Pocket geometry v2 (printable). Inner 42mm fits max rotated 24mm
+        # cube (33.9mm) + gripper envelope; walls lowered to 10mm (no tight insertion).
+        pocket_inner: float = 0.042, pocket_wall_t: float = 0.004,
+        pocket_wall_h: float = 0.010, pocket_floor_t: float = 0.005,
         # Pocket centers (table frame). 4 in a row along y at x=0.30.
         pocket_x: float = 0.30, pocket_ys=( -0.09, -0.03, 0.03, 0.09),
-        place_xy_tol: float = 0.012, place_z_tol: float = 0.006,
+        # Tight footprint-aware tolerances.
+        place_xy_tol: float = 0.003, place_z_tol: float = 0.004,
         static_vel_thresh: float = 2e-2, dwell_time: float = 1.0,
         **kwargs,
     ):
@@ -211,7 +219,7 @@ class RearrangeBase(DefaultCameraEnv):
                                  half_size=[wt / 2, ci / 2, rim_h / 2], material=rim_mat)
             b.initial_pose = sapien.Pose(p=[0, 0, 0])
             b.set_scene_idxs([i])
-            pk = b.build(name=f"pockets-{i}")
+            pk = b.build_kinematic(name=f"pockets-{i}")
             pockets.append(pk)
             self.remove_from_state_dict_registry(pk)
         self.pockets = Actor.merge(pockets, name="pockets")
@@ -228,6 +236,7 @@ class RearrangeBase(DefaultCameraEnv):
         self._randomize_robot_color()
         self._dwell_count = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
         self._was_complete = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        self._dwell_last_step = torch.full((self.num_envs,), -1, dtype=torch.long, device=self.device)
         self._dwell_steps = max(1, int(round(self.dwell_time * 10)))
 
     def _pocket_center(self, p):
@@ -265,6 +274,7 @@ class RearrangeBase(DefaultCameraEnv):
                 self.cubes[k].set_pose(Pose.create_from_pq(xyz, qs))
             self._dwell_count[env_idx] = 0
             self._was_complete[env_idx] = False
+            self._dwell_last_step[env_idx] = -1
             try:
                 self._dwell_steps = max(1, int(round(self.dwell_time * self.control_freq)))
             except Exception:
@@ -299,10 +309,13 @@ class RearrangeBase(DefaultCameraEnv):
     def _object_in_pocket(self, obj_idx, pocket_idx):
         p = self.cubes[obj_idx].pose.p
         t = self._pocket_center(pocket_idx)
-        dxy = torch.linalg.norm(p[:, :2] - t[:, :2], dim=1)
-        allow = (self.pocket_inner / 2 - self.cube_half) + self.place_xy_tol
-        allow = torch.clamp(allow, min=0.002)
-        xy_ok = dxy <= allow
+        # Footprint/orientation-aware full containment (2mm margin).
+        yaw = _yaw_from_quat(self.cubes[obj_idx].pose.q)
+        ext = self.cube_half * (torch.abs(torch.cos(yaw)) + torch.abs(torch.sin(yaw)))
+        margin = 0.002
+        dx = torch.abs(p[:, 0] - t[:, 0])
+        dy = torch.abs(p[:, 1] - t[:, 1])
+        xy_ok = (dx <= (self.pocket_inner / 2 - ext - margin)) & (dy <= (self.pocket_inner / 2 - ext - margin))
         z_exp = t[:, 2] + self.cube_half
         dz = torch.abs(p[:, 2] - z_exp)
         z_ok = dz <= self.place_z_tol
@@ -310,7 +323,7 @@ class RearrangeBase(DefaultCameraEnv):
         v = torch.linalg.norm(self.cubes[obj_idx].linear_velocity, dim=-1)
         static = v <= self.static_vel_thresh
         released = (~self.agent.is_touching(self.cubes[obj_idx])) & (~self.agent.is_grasping(self.cubes[obj_idx]))
-        return xy_ok & z_ok & low & static & released, dxy, dz
+        return xy_ok & z_ok & low & static & released, dx + dy, dz
 
     def evaluate(self):
         n = self.NUM_OBJECTS
@@ -348,8 +361,13 @@ class RearrangeBase(DefaultCameraEnv):
             released &= ~self.agent.is_grasping(self.cubes[k])
         robot_static = self.agent.is_static()
         complete_stable = complete & released & robot_static
-        self._was_complete = self._was_complete | complete_stable
-        self._dwell_count = torch.where(complete_stable, self._dwell_count + 1, torch.zeros_like(self._dwell_count))
+        cur_step = self.elapsed_steps.reshape(-1).to(torch.long).to(self.device)
+        new_step = cur_step != self._dwell_last_step
+        self._was_complete = torch.where(new_step, self._was_complete | complete_stable, self._was_complete)
+        self._dwell_count = torch.where(
+            ~new_step, self._dwell_count,
+            torch.where(complete_stable, self._dwell_count + 1, torch.zeros_like(self._dwell_count)))
+        self._dwell_last_step = torch.where(new_step, cur_step, self._dwell_last_step)
         success = self._dwell_count >= self._dwell_steps
         # Per-object correctness (object k in its goal pocket).
         # Goal pocket of object k: index where goal[p]==k.
@@ -405,13 +423,13 @@ class RearrangeBase(DefaultCameraEnv):
         return self.compute_dense_reward(obs=obs, action=action, info=info) / max_r
 
 
-@register_env("SO101Rearrange3-v1", max_episode_steps=300)
+@register_env("SO101Rearrange3-v1", max_episode_steps=400)
 class Rearrange3(RearrangeBase):
     NUM_OBJECTS = 3
     N_POCKETS = 4
 
 
-@register_env("SO101Rearrange2-v1", max_episode_steps=200)
+@register_env("SO101Rearrange2-v1", max_episode_steps=300)
 class Rearrange2(RearrangeBase):
     NUM_OBJECTS = 2
     N_POCKETS = 3

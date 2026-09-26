@@ -45,6 +45,8 @@ class QCConfig:
     gamma: float = 0.9
     tau: float = 0.01
     lr: float = 3e-4
+    bc_encoder_grad: bool = True
+    """let the BC flow loss train the shared CNN encoder too (critic-only encoder: False)"""
 
 
 def _glorot(m):
@@ -210,7 +212,11 @@ class QCAgent(nn.Module):
             q_min=q.detach().min(), critic_valid_frac=b["critic_valid"].mean().detach())
         loss = critic_loss
         if update_actor:
-            actor_loss, actor_info = self._actor_loss(feat.detach(), b["state"], b["valid"], actions)
+            # bc_encoder_grad: the BC flow loss also trains the shared encoder (the Q/distill terms stay
+            # detached as in Squint). With a critic-only encoder the BC flow cannot learn the visual
+            # features imitation needs: offline BC fitted the demo actions yet placed zero cubes.
+            feat_bc = feat if cfg.bc_encoder_grad else feat.detach()
+            actor_loss, actor_info = self._actor_loss(feat.detach(), b["state"], b["valid"], actions, feat_bc)
             info.update(actor_info)
             loss = loss + actor_loss
 
@@ -224,15 +230,16 @@ class QCAgent(nn.Module):
             torch._foreach_lerp_(list(self.critic_target.parameters()), list(self.critic.parameters()), cfg.tau)
         return info
 
-    def _actor_loss(self, feat, state, valid, actions):
+    def _actor_loss(self, feat, state, valid, actions, feat_bc=None):
         cfg = self.cfg
         B = actions.shape[0]
+        feat_bc = feat if feat_bc is None else feat_bc
 
         # flow-matching BC loss on the dataset/replay chunk; only on valid chunk steps
         x0 = torch.randn_like(actions)
         t = torch.rand(B, 1, device=actions.device)
         xt = (1 - t) * x0 + t * actions
-        pred = self.bc_flow(feat, state, xt, t)
+        pred = self.bc_flow(feat_bc, state, xt, t)
         bc_loss = (((pred - (actions - x0)) ** 2).view(B, cfg.horizon, self.n_act) * valid.unsqueeze(-1)).mean()
 
         if cfg.actor_type == "distill-ddpg":

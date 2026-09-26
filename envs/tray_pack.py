@@ -37,10 +37,17 @@ N_COMP = 3
 COLORS = [np.array([1, 0, 0, 1]), np.array([0, 1, 0, 1]), np.array([0, 0, 1, 1])]  # R,G,B
 
 
+def _yaw_from_quat(q: torch.Tensor) -> torch.Tensor:
+    """Yaw about z from (w,x,y,z) quats. Objects are upright (lock_x/y)."""
+    w, x, y, z = q[..., 0], q[..., 1], q[..., 2], q[..., 3]
+    return torch.atan2(2 * (w * z + x * y), 1 - 2 * (y * y + z * z))
+
+
 @dataclass
 class TrayPackRandomizationConfig(DefaultRandomizationConfig):
     robot_qpos_noise_std: float = np.deg2rad(5)
-    cube_half_size_range: Sequence[float] = (0.011, 0.013)  # 22-26 mm
+    # 20-24 mm sides. Max rotated footprint 24*sqrt2=33.9mm < 42mm inner.
+    cube_half_size_range: Sequence[float] = (0.010, 0.012)
     item_friction_range: Sequence[float] = (0.1, 0.5)
     item_density_range: Sequence[float] = (200, 200)
     randomize_item_color: bool = False
@@ -59,16 +66,19 @@ class TrayPackBase(DefaultCameraEnv):
         domain_randomization_config: Union[TrayPackRandomizationConfig, dict] = TrayPackRandomizationConfig(),
         domain_randomization=False,
         spawn_box_pos=(0.3, 0.0), spawn_box_half_size=0.2 / 2,
-        # Tray geometry (meters, configurable). Compartment inner size must fit
-        # every object with grasp/placement clearance.
-        comp_inner: float = 0.035, wall_t: float = 0.005, wall_h: float = 0.015,
+        # Tray geometry v2 (meters, configurable). Inner 42mm fits max rotated
+        # 24mm cube (33.9mm diagonal) + gripper envelope; walls lowered to
+        # 10mm so jaws can overhang during release/withdrawal (no tight insertion).
+        comp_inner: float = 0.042, wall_t: float = 0.004, wall_h: float = 0.010,
         floor_t: float = 0.005,
-        tray_xy=(0.32, -0.02),
-        place_xy_tol: float = 0.007, place_z_tol: float = 0.005,
+        tray_xy=(0.33, -0.055),
+        # Tight footprint-aware tolerances (do NOT count protruding objects).
+        place_xy_tol: float = 0.003, place_z_tol: float = 0.004,
         static_vel_thresh: float = 2e-2,
         dwell_time: float = 1.0,
         min_tray_clearance: float = 0.075, min_obj_separation: float = 0.05,
         max_reach_radius: float = 0.38,
+        reward_version: int = 2,
         **kwargs,
     ):
         if robot_uids == "so100":
@@ -101,6 +111,8 @@ class TrayPackBase(DefaultCameraEnv):
         self.min_tray_clearance = min_tray_clearance
         self.min_obj_separation = min_obj_separation
         self.max_reach_radius = max_reach_radius
+        assert reward_version in (1, 2), reward_version
+        self.reward_version = reward_version
         super().__init__(*args, robot_uids=robot_uids, control_mode=control_mode,
                          domain_randomization=domain_randomization,
                          domain_randomization_config=self.domain_randomization_config, **kwargs)
@@ -202,7 +214,7 @@ class TrayPackBase(DefaultCameraEnv):
                 b.add_box_visual(pose=sapien.Pose([cx + ci / 2 + wt / 2, 0, ft + wh + rim_h / 2]), half_size=[wt / 2, ci / 2, rim_h / 2], material=rim_mat)
             b.initial_pose = sapien.Pose(p=[float(self.tray_xy[0]), float(self.tray_xy[1]), 0.0])
             b.set_scene_idxs([i])
-            tr = b.build(name=f"tray-{i}")
+            tr = b.build_kinematic(name=f"tray-{i}")
             trays.append(tr)
             self.remove_from_state_dict_registry(tr)
         self.tray = Actor.merge(trays, name="tray")
@@ -223,6 +235,7 @@ class TrayPackBase(DefaultCameraEnv):
         self._randomize_robot_color()
         self._dwell_count = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
         self._was_complete = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        self._dwell_last_step = torch.full((self.num_envs,), -1, dtype=torch.long, device=self.device)
         self._dwell_steps = max(1, int(round(self.dwell_time * 10)))
 
     def _comp_world(self):
@@ -251,39 +264,62 @@ class TrayPackBase(DefaultCameraEnv):
             tray_q = torch.zeros((b, 4), device=self.device); tray_q[:, 0] = 1.0  # identity (w,x,y,z)
             self.tray.set_pose(Pose.create_from_pq(tray_xyz, tray_q))
             # Sample cube positions outside tray, non-overlapping, reachable.
+            # Rectangular tray clearance (not conservative circle): cubes must be
+            # outside tray outer bounds + margin (max rotated half-diag 17mm + 8mm).
             spawn_center = self.agent.robot.pose.p + torch.tensor([self.spawn_box_pos[0], self.spawn_box_pos[1], 0])
-            tray_xy = self.tray_xy.to(self.device)
             half = self.cube_half[env_idx]
-            # Tray half-extent for clearance (conservative circle).
-            tray_r = float((N_COMP * self.comp_inner + (N_COMP + 1) * self.wall_t) / 2 + 0.02)
+            total_x = N_COMP * self.comp_inner + (N_COMP + 1) * self.wall_t
+            total_y = self.comp_inner + 2 * self.wall_t
+            tray_hx = total_x / 2 + 0.025
+            tray_hy = total_y / 2 + 0.025
+            tray_c = self.tray_xy.to(self.device)
             base_centers = spawn_center[env_idx, :2]
             def rand_xy_for(centers):
                 n = centers.shape[0]
                 return (torch.rand((n, 2), device=self.device) * 2 - 1) * self.spawn_box_half_size + centers
             xys = [rand_xy_for(base_centers) for _ in range(N_COMP)]
+            valid = torch.zeros(b, dtype=torch.bool, device=self.device)
             for _ in range(60):
                 ok = torch.ones(b, dtype=torch.bool, device=self.device)
                 for k in range(N_COMP):
-                    ok &= torch.linalg.norm(xys[k] - tray_xy.unsqueeze(0), dim=1) >= (tray_r + self.min_tray_clearance * 0)
+                    dx = torch.abs(xys[k][:, 0] - tray_c[0])
+                    dy = torch.abs(xys[k][:, 1] - tray_c[1])
+                    outside = (dx >= tray_hx) | (dy >= tray_hy)
+                    ok &= outside
                     ok &= torch.linalg.norm(xys[k], dim=1) <= self.max_reach_radius
                 for a in range(N_COMP):
                     for c in range(a + 1, N_COMP):
+                        # Conservative: max rotated half-diagonal sum (24mm cubes
+                        # need 34mm; min separation 50mm covers all yaws).
                         ok &= torch.linalg.norm(xys[a] - xys[c], dim=1) >= self.min_obj_separation
                 # Not already solved (cubes start outside tray by construction, so ok).
                 if bool(ok.all()):
+                    valid = torch.ones_like(valid)
                     break
                 bad = ~ok
                 if int(bad.sum().item()) == 0:
+                    valid = ok
                     break
                 bad_centers = base_centers[bad]
                 for k in range(N_COMP):
                     xys[k][bad] = rand_xy_for(bad_centers)
+            else:
+                valid = ok
+            if not bool(valid.all()):
+                # Explicit fallback: do not accept invalid states. Use fixed
+                # safe spots (outside tray, separated, reachable) for failures.
+                import warnings
+                warnings.warn(f"TrayPack rejection sampling exhausted for {(~valid).sum().item()}/{b} envs; using fallback layout")
+                fb = torch.tensor([[0.22, 0.06], [0.22, -0.06], [0.24, 0.0]], device=self.device)
+                for k in range(N_COMP):
+                    xys[k][~valid] = fb[k].unsqueeze(0).expand(int((~valid).sum().item()), -1)
             for k in range(N_COMP):
                 xyz = torch.stack([xys[k][:, 0], xys[k][:, 1], half], dim=1)
                 qs = randomization.random_quaternions(b, lock_x=True, lock_y=True)
                 self.cubes[k].set_pose(Pose.create_from_pq(xyz, qs))
             self._dwell_count[env_idx] = 0
             self._was_complete[env_idx] = False
+            self._dwell_last_step[env_idx] = -1
             try:
                 self._dwell_steps = max(1, int(round(self.dwell_time * self.control_freq)))
             except Exception:
@@ -317,28 +353,37 @@ class TrayPackBase(DefaultCameraEnv):
 
     def _per_object_correct(self):
         comp = self._comp_world()  # (N,3,3)
-        correct = []
+        correct, geom = [], []
         for k in range(N_COMP):
             p = self.cubes[k].pose.p
             t = comp[:, k, :]
-            dxy = torch.linalg.norm(p[:, :2] - t[:, :2], dim=1)
-            # Fully inside: center within (inner/2 - half) + tol, resting on floor.
-            allow_xy = (self.comp_inner / 2 - self.cube_half) + self.place_xy_tol
-            allow_xy = torch.clamp(allow_xy, min=0.002)
-            xy_ok = dxy <= allow_xy
+            # Footprint/orientation-aware full containment: rotated half-extent
+            # per axis must fit inside inner bounds with 2mm margin. A 24mm
+            # cube at 45deg spans 33.9mm; centre-distance allowances alone
+            # would wrongly count protruding objects as seated.
+            yaw = _yaw_from_quat(self.cubes[k].pose.q)
+            ext = self.cube_half * (torch.abs(torch.cos(yaw)) + torch.abs(torch.sin(yaw)))
+            margin = 0.002
+            dx = torch.abs(p[:, 0] - t[:, 0])
+            dy = torch.abs(p[:, 1] - t[:, 1])
+            xy_ok = (dx <= (self.comp_inner / 2 - ext - margin)) & (dy <= (self.comp_inner / 2 - ext - margin))
             z_exp = t[:, 2] + self.cube_half
             dz = torch.abs(p[:, 2] - z_exp)
             z_ok = dz <= self.place_z_tol
-            # Not stacked / not on rim: z must be near floor (not higher), and
-            # no other cube within stacking distance above.
+            # Not stacked / not on rim: z must be near floor (not higher).
             low_enough = p[:, 2] <= (z_exp + self.place_z_tol)
             # Static + released.
             v = torch.linalg.norm(self.cubes[k].linear_velocity, dim=-1)
             static = v <= self.static_vel_thresh
             touching = self.agent.is_touching(self.cubes[k])
             grasped = self.agent.is_grasping(self.cubes[k])
+            # inside the walls and below the wall top (held or resting): the cube has been lowered into
+            # its compartment; used by the v2 reward so lowering it in pays before release
+            in_comp = xy_ok & (p[:, 2] <= z_exp + self.wall_h)
             ok = xy_ok & z_ok & low_enough & static & (~touching) & (~grasped)
             correct.append(ok)
+            geom.append(in_comp)
+        self._in_comp = torch.stack(geom, dim=1)  # (N,3) seated geometrically, may still be held
         return torch.stack(correct, dim=1)  # (N,3)
 
     def evaluate(self):
@@ -359,8 +404,14 @@ class TrayPackBase(DefaultCameraEnv):
             released &= ~self.agent.is_grasping(self.cubes[k])
         robot_static = self.agent.is_static()
         complete_stable = complete & released & robot_static
-        self._was_complete = self._was_complete | complete_stable
-        self._dwell_count = torch.where(complete_stable, self._dwell_count + 1, torch.zeros_like(self._dwell_count))
+        # Dwell advances once per control step only.
+        cur_step = self.elapsed_steps.reshape(-1).to(torch.long).to(self.device)
+        new_step = cur_step != self._dwell_last_step
+        self._was_complete = torch.where(new_step, self._was_complete | complete_stable, self._was_complete)
+        self._dwell_count = torch.where(
+            ~new_step, self._dwell_count,
+            torch.where(complete_stable, self._dwell_count + 1, torch.zeros_like(self._dwell_count)))
+        self._dwell_last_step = torch.where(new_step, cur_step, self._dwell_last_step)
         success = self._dwell_count >= self._dwell_steps
         return dict(success=success, per_object_correct=per,
                     num_correct=active.sum(dim=1),
@@ -369,34 +420,354 @@ class TrayPackBase(DefaultCameraEnv):
                     is_released=released)
 
     def compute_dense_reward(self, obs: Any, action: torch.Tensor, info: dict):
-        # Any-order: sum of per-object shaping + placed-count bonus (state-based,
-        # no repeatable event bonuses).
+        """Raw dense reward (max 14 for 3 cubes). Each term is also written into File: dir,	Node: Top	This is the top of the INFO tree
+
+  This (the Directory node) gives a menu of major topics.
+  Typing "q" exits, "H" lists all Info commands, "d" returns here,
+  "h" gives a primer for first-timers,
+  "mEmacs<Return>" visits the Emacs manual, etc.
+
+  In Emacs, you can click mouse button 2 on a menu item or cross reference
+  to select it.
+
+* Menu:
+
+Archiving
+* Xorrecord: (xorrecord).       Emulates CD/DVD/BD program cdrecord
+* Xorriso: (xorriso).           Burns ISO 9660 on CD, DVD, BD.
+* Xorrisofs: (xorrisofs).       Emulates ISO 9660 program mkisofs
+
+Basics
+* Common options: (coreutils)Common options.
+* Coreutils: (coreutils).       Core GNU (file, text, shell) utilities.
+* Date input formats: (coreutils)Date input formats.
+* File permissions: (coreutils)File permissions.
+                                Access modes.
+* Finding files: (find).        Operating on files matching certain criteria.
+* Time: (time).                 time
+
+C++ libraries
+* autosprintf: (autosprintf).   Support for printf format strings in C++.
+
+Compression
+* Gzip: (gzip).                 General (de)compression of files (lzw).
+
+Development
+* Com_err: (com_err).           A Common Error Description Library for UNIX.
+* SSIP: (ssip).                 Speech Synthesis Interface Protocol.
+* Speech Dispatcher: (speech-dispatcher).
+                                Speech Dispatcher.
+* bzip2 and libbzip2, version 1.0.8: (manual).
+                                A program and library for data compression
+* libext2fs: (libext2fs).       The EXT2FS library.
+* libffi: (libffi).             Portable foreign function interface library.
+
+Editors
+* nano: (nano).                 Small and friendly text editor.
+
+Encryption
+* Nettle: (nettle).             A low-level cryptographic library.
+
+GNU Gettext Utilities
+* autopoint: (gettext)autopoint Invocation.
+                                Copy gettext infrastructure.
+* envsubst: (gettext)envsubst Invocation.
+                                Expand environment variables.
+* gettextize: (gettext)gettextize Invocation.
+                                Prepare a package for gettext.
+* gettext: (gettext).           GNU gettext utilities.
+* ISO3166: (gettext)Country Codes.
+                                ISO 3166 country codes.
+* ISO639: (gettext)Language Codes.
+                                ISO 639 language codes.
+* msgattrib: (gettext)msgattrib Invocation.
+                                Select part of a PO file.
+* msgcat: (gettext)msgcat Invocation.
+                                Combine several PO files.
+* msgcmp: (gettext)msgcmp Invocation.
+                                Compare a PO file and template.
+* msgcomm: (gettext)msgcomm Invocation.
+                                Match two PO files.
+* msgconv: (gettext)msgconv Invocation.
+                                Convert PO file to encoding.
+* msgen: (gettext)msgen Invocation.
+                                Create an English PO file.
+* msgexec: (gettext)msgexec Invocation.
+                                Process a PO file.
+* msgfilter: (gettext)msgfilter Invocation.
+                                Pipe a PO file through a filter.
+* msgfmt: (gettext)msgfmt Invocation.
+                                Make MO files out of PO files.
+* msggrep: (gettext)msggrep Invocation.
+                                Select part of a PO file.
+* msginit: (gettext)msginit Invocation.
+                                Create a fresh PO file.
+* msgmerge: (gettext)msgmerge Invocation.
+                                Update a PO file from template.
+* msgunfmt: (gettext)msgunfmt Invocation.
+                                Uncompile MO file into PO file.
+* msguniq: (gettext)msguniq Invocation.
+                                Unify duplicates for PO file.
+* ngettext: (gettext)ngettext Invocation.
+                                Translate a message with plural.
+* xgettext: (gettext)xgettext Invocation.
+                                Extract strings into a PO file.
+
+GNU Libraries
+* Assuan: (assuan).             An IPC library for non-persistent servers.
+* GPGME: (gpgme).               Adding support for cryptography to your 
+                                  program.
+
+GNU organization
+* Maintaining Findutils: (find-maint).
+                                Maintaining GNU findutils
+
+GNU Utilities
+* dirmngr-client: (gnupg).      X.509 CRL and OCSP client.
+* dirmngr: (gnupg).             X.509 CRL and OCSP server.
+* gpg-agent: (gnupg).           The secret key daemon.
+* gpg2: (gnupg).                OpenPGP encryption and signing tool.
+* gpgsm: (gnupg).               S/MIME encryption and signing tool.
+
+Individual utilities
+* aclocal-invocation: (automake-1.16)aclocal Invocation.
+                                                Generating aclocal.m4.
+* arch: (coreutils)arch invocation.             Print machine hardware name.
+* automake-invocation: (automake-1.16)automake Invocation.
+                                                Generating Makefile.in.
+* b2sum: (coreutils)b2sum invocation.           Print or check BLAKE2 digests.
+* base32: (coreutils)base32 invocation.         Base32 encode/decode data.
+* base64: (coreutils)base64 invocation.         Base64 encode/decode data.
+* basename: (coreutils)basename invocation.     Strip directory and suffix.
+* basenc: (coreutils)basenc invocation.         Encoding/decoding of data.
+* cat: (coreutils)cat invocation.               Concatenate and write files.
+* chcon: (coreutils)chcon invocation.           Change SELinux CTX of files.
+* chgrp: (coreutils)chgrp invocation.           Change file groups.
+* chmod: (coreutils)chmod invocation.           Change access permissions.
+* chown: (coreutils)chown invocation.           Change file owners and groups.
+* chroot: (coreutils)chroot invocation.         Specify the root directory.
+* cksum: (coreutils)cksum invocation.           Print POSIX CRC checksum.
+* cmp: (diffutils)Invoking cmp.                 Compare 2 files byte by byte.
+* comm: (coreutils)comm invocation.             Compare sorted files by line.
+* cp: (coreutils)cp invocation.                 Copy files.
+* csplit: (coreutils)csplit invocation.         Split by context.
+* cut: (coreutils)cut invocation.               Print selected parts of lines.
+* date: (coreutils)date invocation.             Print/set system date and time.
+* dd: (coreutils)dd invocation.                 Copy and convert a file.
+* df: (coreutils)df invocation.                 Report file system usage.
+* diff: (diffutils)Invoking diff.               Compare 2 files line by line.
+* diff3: (diffutils)Invoking diff3.             Compare 3 files line by line.
+* dircolors: (coreutils)dircolors invocation.   Color setup for ls.
+* dirname: (coreutils)dirname invocation.       Strip last file name component.
+* dir: (coreutils)dir invocation.               List directories briefly.
+* du: (coreutils)du invocation.                 Report file usage.
+* echo: (coreutils)echo invocation.             Print a line of text.
+* env: (coreutils)env invocation.               Modify the environment.
+* expand: (coreutils)expand invocation.         Convert tabs to spaces.
+* expr: (coreutils)expr invocation.             Evaluate expressions.
+* factor: (coreutils)factor invocation.         Print prime factors
+* false: (coreutils)false invocation.           Do nothing, unsuccessfully.
+* find: (find)Invoking find.                    Finding and acting on files.
+* fmt: (coreutils)fmt invocation.               Reformat paragraph text.
+* fold: (coreutils)fold invocation.             Wrap long input lines.
+* groups: (coreutils)groups invocation.         Print group names a user is in.
+* gunzip: (gzip)Overview.                       Decompression.
+* gzexe: (gzip)Overview.                        Compress executables.
+* head: (coreutils)head invocation.             Output the first part of files.
+* hostid: (coreutils)hostid invocation.         Print numeric host identifier.
+* hostname: (coreutils)hostname invocation.     Print or set system name.
+* id: (coreutils)id invocation.                 Print user identity.
+* install: (coreutils)install invocation.       Copy files and set attributes.
+* join: (coreutils)join invocation.             Join lines on a common field.
+* kill: (coreutils)kill invocation.             Send a signal to processes.
+* link: (coreutils)link invocation.             Make hard links between files.
+* ln: (coreutils)ln invocation.                 Make links between files.
+* locate: (find)Invoking locate.                Finding files in a database.
+* logname: (coreutils)logname invocation.       Print current login name.
+* ls: (coreutils)ls invocation.                 List directory contents.
+* md5sum: (coreutils)md5sum invocation.         Print or check MD5 digests.
+* mkdir: (coreutils)mkdir invocation.           Create directories.
+* mkfifo: (coreutils)mkfifo invocation.         Create FIFOs (named pipes).
+* mknod: (coreutils)mknod invocation.           Create special files.
+* mktemp: (coreutils)mktemp invocation.         Create temporary files.
+* mv: (coreutils)mv invocation.                 Rename files.
+* nice: (coreutils)nice invocation.             Modify niceness.
+* nl: (coreutils)nl invocation.                 Number lines and write files.
+* nohup: (coreutils)nohup invocation.           Immunize to hangups.
+* nproc: (coreutils)nproc invocation.           Print the number of processors.
+* numfmt: (coreutils)numfmt invocation.         Reformat numbers.
+* od: (coreutils)od invocation.                 Dump files in octal, etc.
+* paste: (coreutils)paste invocation.           Merge lines of files.
+* patch: (diffutils)Invoking patch.             Apply a patch to a file.
+* pathchk: (coreutils)pathchk invocation.       Check file name portability.
+* printenv: (coreutils)printenv invocation.     Print environment variables.
+* printf: (coreutils)printf invocation.         Format and print data.
+* pr: (coreutils)pr invocation.                 Paginate or columnate files.
+* ptx: (coreutils)ptx invocation.               Produce permuted indexes.
+* pwd: (coreutils)pwd invocation.               Print working directory.
+* readlink: (coreutils)readlink invocation.     Print referent of a symlink.
+* realpath: (coreutils)realpath invocation.     Print resolved file names.
+* rmdir: (coreutils)rmdir invocation.           Remove empty directories.
+* rm: (coreutils)rm invocation.                 Remove files.
+* runcon: (coreutils)runcon invocation.         Run in specified SELinux CTX.
+* sdiff: (diffutils)Invoking sdiff.             Merge 2 files side-by-side.
+* seq: (coreutils)seq invocation.               Print numeric sequences
+* sha1sum: (coreutils)sha1sum invocation.       Print or check SHA-1 digests.
+* sha2: (coreutils)sha2 utilities.              Print or check SHA-2 digests.
+* shred: (coreutils)shred invocation.           Remove files more securely.
+* shuf: (coreutils)shuf invocation.             Shuffling text files.
+* sleep: (coreutils)sleep invocation.           Delay for a specified time.
+* sort: (coreutils)sort invocation.             Sort text files.
+* split: (coreutils)split invocation.           Split into pieces.
+* stat: (coreutils)stat invocation.             Report file(system) status.
+* stdbuf: (coreutils)stdbuf invocation.         Modify stdio buffering.
+* stty: (coreutils)stty invocation.             Print/change terminal settings.
+* sum: (coreutils)sum invocation.               Print traditional checksum.
+* sync: (coreutils)sync invocation.             Sync files to stable storage.
+* tac: (coreutils)tac invocation.               Reverse files.
+* tail: (coreutils)tail invocation.             Output the last part of files.
+* tee: (coreutils)tee invocation.               Redirect to multiple files.
+* test: (coreutils)test invocation.             File/string tests.
+* timeout: (coreutils)timeout invocation.       Run with time limit.
+* touch: (coreutils)touch invocation.           Change file timestamps.
+* true: (coreutils)true invocation.             Do nothing, successfully.
+* truncate: (coreutils)truncate invocation.     Shrink/extend size of a file.
+* tr: (coreutils)tr invocation.                 Translate characters.
+* tsort: (coreutils)tsort invocation.           Topological sort.
+* tty: (coreutils)tty invocation.               Print terminal name.
+* uname: (coreutils)uname invocation.           Print system information.
+* unexpand: (coreutils)unexpand invocation.     Convert spaces to tabs.
+* uniq: (coreutils)uniq invocation.             Uniquify files.
+* unlink: (coreutils)unlink invocation.         Removal via unlink(2).
+* updatedb: (find)Invoking updatedb.            Building the locate database.
+* uptime: (coreutils)uptime invocation.         Print uptime and load.
+* users: (coreutils)users invocation.           Print current user names.
+* vdir: (coreutils)vdir invocation.             List directories verbosely.
+* wc: (coreutils)wc invocation.                 Line, word, and byte counts.
+* whoami: (coreutils)whoami invocation.         Print effective user ID.
+* who: (coreutils)who invocation.               Print who is logged in.
+* xargs: (find)Invoking xargs.                  Operating on many files.
+* yes: (coreutils)yes invocation.               Print a string indefinitely.
+* zcat: (gzip)Overview.                         Decompression to stdout.
+* zdiff: (gzip)Overview.                        Compare compressed files.
+* zforce: (gzip)Overview.                       Force .gz extension on files.
+* zgrep: (gzip)Overview.                        Search compressed files.
+* zmore: (gzip)Overview.                        Decompression output by pages.
+
+Kernel
+* grub-dev: (grub-dev).         The GRand Unified Bootloader Dev
+* grub-install: (grub)Invoking grub-install.
+                                Install GRUB on your drive
+* grub-mkconfig: (grub)Invoking grub-mkconfig.
+                                Generate GRUB configuration
+* grub-mkpasswd-pbkdf2: (grub)Invoking grub-mkpasswd-pbkdf2.
+* grub-mkrelpath: (grub)Invoking grub-mkrelpath.
+* grub-mkrescue: (grub)Invoking grub-mkrescue.
+                                Make a GRUB rescue image
+* grub-mount: (grub)Invoking grub-mount.
+                                Mount a file system using GRUB
+* grub-probe: (grub)Invoking grub-probe.
+                                Probe device information
+* grub-script-check: (grub)Invoking grub-script-check.
+* GRUB: (grub).                 The GRand Unified Bootloader
+
+Libraries
+* RLuserman: (rluserman).       The GNU readline library User's Manual.
+* libgpg-error: (gpgrt).        Error codes and common code for GnuPG.
+
+Math
+* bc: (bc).                     An arbitrary precision calculator language.
+
+Miscellaneous
+* dc: (dc).                     Arbitrary precision RPN "Desktop Calculator".
+
+Network applications
+* Wget: (wget).                 Non-interactive network downloader.
+
+Programming
+* flex: (flex).                 Fast lexical analyzer generator (lex 
+                                  replacement).
+
+Programming Tools
+* Gperf: (gperf).               Perfect Hash Function Generator.
+
+Software development
+* Automake: (automake-1.16).    Making GNU standards-compliant Makefiles.
+* Automake-history: (automake-history).
+                                History of Automake development.
+
+Sound
+* SSIP: (ssip).                 Speech Synthesis Interface Protocol.
+* Say for Speech Dispatcher: (spd-say).
+                                Say.
+* Speech Dispatcher: (speech-dispatcher).
+                                Speech Dispatcher.
+
+Texinfo documentation system
+* info stand-alone: (info-stnd).
+                                Read Info documents without Emacs.
+
+Text creation and manipulation
+* Diffutils: (diffutils).       Comparing and merging files.
+* M4: (m4).                     A powerful macro processor.
+* grep: (grep).                 Print lines that match patterns.
+* sed: (sed).                   Stream EDitor.   as rew_<name>
+        (summed over cubes, raw units) so training/eval can log where reward comes from.
+
+        v1 (original): per unplaced cube 0.5*reach + place + grasped; placed cube 3; +1 per placed;
+          -3 touching table, -1 touching tray. Placing a cube dips the reward (grasp bonus lost and
+          the cube only counts once released and the gripper is clear; jaws brushing the tray walls
+          cost -1/step), so RL learned to hover a held cube above its compartment.
+        v2: reward rises monotonically through a placement: a cube seated inside its compartment is
+          worth 3 even while still held (no dip on release), reach only pulls toward the nearest
+          unplaced cube, tray contact costs -0.1. Placed/success/table terms are unchanged.
+        """
         tcp = self.agent.tcp_pose.p
         comp = self._comp_world()
-        per_bonus = torch.zeros(self.num_envs, device=self.device)
-        reach_terms = []
+        N, dev = self.num_envs, self.device
+        z = lambda: torch.zeros(N, device=dev)
+        terms = dict(reach=z(), place=z(), grasp=z(), in_comp=z(), placed=z())
+        correct_all = info["per_object_correct"].float() if "per_object_correct" in info else torch.zeros((N, N_COMP), device=dev)
+        in_comp_all = getattr(self, "_in_comp", torch.zeros((N, N_COMP), dtype=torch.bool, device=dev)).float()
+        d_tcp_all = []
         for k in range(self.NUM_OBJECTS):
             p = self.cubes[k].pose.p
             t = comp[:, k, :]
             goal = torch.stack([t[:, 0], t[:, 1], t[:, 2] + self.cube_half], dim=1)
             d_tcp = torch.linalg.norm(tcp - p, dim=1)
-            d_goal = torch.linalg.norm(goal - p, dim=1)
-            reach = 1 - torch.tanh(5 * d_tcp)
-            place = 1 - torch.tanh(5 * d_goal)
+            place = 1 - torch.tanh(5 * torch.linalg.norm(goal - p, dim=1))
             grasped = self.agent.is_grasping(self.cubes[k]).float()
-            # If already correct, give sustained bonus; else shaping.
-            correct = info["per_object_correct"][:, k].float() if "per_object_correct" in info else torch.zeros_like(reach)
-            per_bonus = per_bonus + correct * 3.0 + (1 - correct) * (reach * 0.5 + place + grasped)
-            reach_terms.append(d_tcp)
-        # Focus reaching on nearest incorrect object implicitly via sum; add
-        # small bonus for number correct (state-based, not farmable by cycling
-        # because leaving the compartment removes it).
-        num_c = info["num_correct"].float() if "num_correct" in info else torch.zeros(self.num_envs, device=self.device)
-        reward = per_bonus + num_c * 1.0
+            correct = correct_all[:, k]
+            if self.reward_version == 1:
+                todo = 1 - correct
+                terms["reach"] += todo * 0.5 * (1 - torch.tanh(5 * d_tcp))
+                terms["place"] += todo * place
+                terms["grasp"] += todo * grasped
+                terms["placed"] += correct * 3.0
+            else:
+                seated = torch.maximum(in_comp_all[:, k], correct)  # seated geometrically (held or not)
+                todo = 1 - seated
+                terms["place"] += todo * place
+                terms["grasp"] += todo * grasped
+                terms["in_comp"] += seated * (1 - correct) * 3.0  # seated but not yet released/still
+                terms["placed"] += correct * 3.0
+                d_tcp_all.append(torch.where(seated > 0, torch.full_like(d_tcp, 1e3), d_tcp))
+        if self.reward_version == 2 and d_tcp_all:
+            d_near = torch.stack(d_tcp_all, dim=1).min(dim=1).values
+            terms["reach"] = torch.where(d_near < 1e2, 0.5 * (1 - torch.tanh(5 * d_near)), torch.zeros_like(d_near))
+        num_c = info["num_correct"].float() if "num_correct" in info else z()
+        terms["count"] = num_c * 1.0
+        reward = sum(terms.values())
         max_r = 3.0 * self.NUM_OBJECTS + 1.0 * self.NUM_OBJECTS + 2.0
-        reward[info["success"]] = max_r
-        reward = reward - 3 * self.agent.is_touching(self.table_scene.table).float()
-        reward = reward - 2 * self.agent.is_touching(self.tray).float() * 0.5
+        success = info["success"] if "success" in info else torch.zeros(N, dtype=torch.bool, device=dev)
+        terms["success_bonus"] = torch.where(success, max_r - reward, z())
+        reward = torch.where(success, torch.full_like(reward, max_r), reward)
+        terms["table_pen"] = -3.0 * self.agent.is_touching(self.table_scene.table).float()
+        terms["tray_pen"] = -(1.0 if self.reward_version == 1 else 0.1) * self.agent.is_touching(self.tray).float()
+        reward = reward + terms["table_pen"] + terms["tray_pen"]
+        for k, v in terms.items():
+            info[f"rew_{k}"] = v
+        info["rew_total"] = reward
         return reward
 
     def compute_normalized_dense_reward(self, obs: Any, action: torch.Tensor, info: dict):
@@ -404,16 +775,16 @@ class TrayPackBase(DefaultCameraEnv):
         return self.compute_dense_reward(obs=obs, action=action, info=info) / max_r
 
 
-@register_env("SO101TrayPack1-v1", max_episode_steps=100)
+@register_env("SO101TrayPack1-v1", max_episode_steps=150)
 class TrayPack1(TrayPackBase):
     NUM_OBJECTS = 1
 
 
-@register_env("SO101TrayPack2-v1", max_episode_steps=150)
+@register_env("SO101TrayPack2-v1", max_episode_steps=200)
 class TrayPack2(TrayPackBase):
     NUM_OBJECTS = 2
 
 
-@register_env("SO101TrayPack3-v1", max_episode_steps=200)
+@register_env("SO101TrayPack3-v1", max_episode_steps=300)
 class TrayPack3(TrayPackBase):
     NUM_OBJECTS = 3

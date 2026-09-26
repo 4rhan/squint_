@@ -36,7 +36,10 @@ from train_squint import Args, Logger, evaluate
 @dataclass
 class QCArgs(Args):
     agent_name: Optional[str] = "squint_qc"
-    exp_name: Optional[str] = "qc_baseline"
+    exp_name: Optional[str] = None
+    """run folder under runs/; default <env_id>__qc__<seed>__<unix time>, so runs never overwrite each other"""
+    num_eval_envs: int = 64
+    """eval episodes per evaluation; with 16, one success moves the rate by 6%, too noisy for these tasks"""
     gamma: float = 0.9
     """discount per env step (the h-step backup uses gamma**horizon). Squint's tuned value for these
     50-step dense-reward tasks; the official QC's 0.99 targets long sparse-reward OGBench tasks."""
@@ -72,6 +75,11 @@ class QCArgs(Args):
     num_layers: int = 3
     """actor/critic MLP size (Squint's; the official QC uses 512 x 4)"""
     lr: float = 3e-4
+    bc_encoder_grad: bool = True
+    reward_version: Optional[int] = None
+    """TrayPack reward version (1 = original, 2 = no dip when placing); None = env default (2).
+    The demo file's rewards must come from the same version (examples/relabel_demo_rewards.py)."""
+    """BC flow loss also trains the shared image encoder (--no-bc_encoder_grad = old critic-only encoder)"""
 
     sim_backend: str = "gpu"
     """'gpu' for real runs; 'cpu' (with --num-envs 1 --num-eval-envs 1) to smoke-test the script without a GPU"""
@@ -134,6 +142,9 @@ if __name__ == "__main__":
         env_kwargs["domain_randomization"] = eval_env_kwargs["domain_randomization"] = True
     if getattr(args, 'stage2_start_prob', 0) > 0:
         env_kwargs["stage2_start_prob"] = args.stage2_start_prob
+    if args.reward_version is not None:
+        assert args.env_id.startswith("SO101TrayPack"), "--reward_version is only implemented for TrayPack"
+        env_kwargs["reward_version"] = eval_env_kwargs["reward_version"] = args.reward_version
 
     train_envs = gym.make(args.env_id, num_envs=args.num_envs, reconfiguration_freq=args.reconfiguration_freq, **env_kwargs)
     eval_envs = gym.make(args.env_id, num_envs=args.num_eval_envs, reconfiguration_freq=args.eval_reconfiguration_freq, **eval_env_kwargs)
@@ -167,6 +178,21 @@ if __name__ == "__main__":
     act_bias = torch.as_tensor((space.high + space.low) / 2.0, dtype=torch.float32, device=device)
 
     logger = Logger(log_wandb=args.track)
+    # Logger only talks to wandb; also append every logged dict to runs/<run>/metrics.jsonl so a run
+    # without --track can still be inspected (losses, Q values, eval results).
+    import json as _json
+    _metrics_path = os.path.join(os.path.dirname(model_path), "metrics.jsonl")
+    _wandb_log = logger.log
+
+    def _log_with_file(d, step):
+        row = {"step": int(step)}
+        row.update({k: (v.item() if torch.is_tensor(v) else v) for k, v in d.items()
+                    if torch.is_tensor(v) or isinstance(v, (int, float))})
+        with open(_metrics_path, "a") as fh:
+            fh.write(_json.dumps(row) + "\n")
+        _wandb_log(d, step)
+
+    logger.log = _log_with_file
     if args.track:
         wandb.init(project=args.wandb_project_name, entity=args.wandb_entity, config=vars(args), name=run_name,
                    group=args.wandb_group, tags=[args.wandb_group, args.agent_name, args.env_id, f"seed={args.seed}"])
@@ -175,7 +201,8 @@ if __name__ == "__main__":
     cfg = QCConfig(horizon=args.horizon, actor_type=args.actor_type, actor_num_samples=args.actor_num_samples,
                    flow_steps=args.flow_steps, alpha=args.alpha, hidden_dim=args.hidden_dim,
                    actor_layers=args.num_layers, critic_hidden_dim=args.hidden_dim, critic_layers=args.num_layers,
-                   num_q=args.num_q, q_agg=args.q_agg, gamma=args.gamma, tau=args.tau, lr=args.lr)
+                   num_q=args.num_q, q_agg=args.q_agg, gamma=args.gamma, tau=args.tau, lr=args.lr,
+                   bc_encoder_grad=args.bc_encoder_grad)
     agent = QCAgent(cfg, n_obs, n_state, n_act, device)
     if args.checkpoint:
         ckpt = torch.load(args.checkpoint, map_location=device)
@@ -203,7 +230,10 @@ if __name__ == "__main__":
             if key not in demo_clean:
                 demo_clean[key] = store.clone()
             clean = demo_clean[key]
-            store.copy_(color_jitter(clean.view(-1, *clean.shape[2:]), demo_jitter).view_as(clean))
+            # chunked: jittering the whole store at once needs ~1 GB per temporary at 64 px (hue step)
+            flat_clean, flat_store = clean.view(-1, *clean.shape[2:]), store.view(-1, *store.shape[2:])
+            for i in range(0, flat_clean.shape[0], 2048):
+                flat_store[i:i + 2048] = color_jitter(flat_clean[i:i + 2048], demo_jitter)
 
     def sample_offline(n):
         return offline.sample(n, cfg.horizon, cfg.gamma)
@@ -220,8 +250,24 @@ if __name__ == "__main__":
                                 use_terminations=args.partial_reset)  # same rule as the online vector env
         assert offline.rgb.shape[2:] == n_obs and offline.state.shape[-1] == n_state, (
             f"demo obs {tuple(offline.rgb.shape[2:])}/{offline.state.shape[-1]} do not match env {n_obs}/{n_state}")
+        # The critic trains on the rewards stored in the demo file, so they must come from the same reward
+        # function as the env. Demos recorded before reward versions existed are v1.
+        env_rv = getattr(train_envs.unwrapped, "reward_version", None)
+        if env_rv is not None:
+            import h5py, json
+            with h5py.File(args.demo_path, "r") as fh:
+                demo_rv = json.loads(fh.attrs["meta"]).get("reward_version") or 1
+            assert demo_rv == env_rv, (
+                f"demo rewards are reward_version {demo_rv} but the env uses {env_rv}. Relabel the demos:\n"
+                f"  python -m examples.relabel_demo_rewards {args.demo_path} <out.h5> --reward_version {env_rv}\n"
+                f"or train with --reward_version {demo_rv}")
+            print(f"demo rewards and env both use reward_version {env_rv}")
     if max_episode_steps % cfg.horizon:
         print(f"[warn] env horizon {max_episode_steps} is not divisible by the chunk length {cfg.horizon}")
+    if max_episode_steps >= 150 and cfg.gamma < 0.99:
+        print(f"[warn] gamma={cfg.gamma} on a {max_episode_steps}-step task: a reward 50 steps ahead is worth "
+              f"{cfg.gamma ** 50:.3f} of its value, so later stages are nearly invisible to the critic; "
+              f"long tasks need --gamma 0.99")
     if args.offline_steps > 0 and not args.checkpoint:
         for step in tqdm.trange(args.offline_steps, desc="offline pretrain"):
             if step % args.num_updates == 0:
@@ -252,6 +298,7 @@ if __name__ == "__main__":
     eval_envs.reset(seed=args.seed)
     executor.reset()
     global_step, d = 0, {}
+    rew_sums = {}
     avg_returns = deque(maxlen=20)
     pbar = tqdm.tqdm(total=args.total_timesteps, desc="steps")
     offline_wall = logger.wall_time  # so sps below counts only the online phase
@@ -292,7 +339,16 @@ if __name__ == "__main__":
                 info.update(agent.update(sample_batch(), update_actor=grad_step % args.policy_frequency == 0))
             d.update({f"train_rl/{k}": v for k, v in info.items()})
 
+        # per-term reward breakdown (envs that put rew_<term> in info): summed over the episode,
+        # averaged over train envs, logged as train_rew/<term> when the episode ends
+        for key, val in infos.items():
+            if key.startswith("rew_") and torch.is_tensor(val):
+                rew_sums[key[4:]] = rew_sums.get(key[4:], 0.0) + float(val.float().mean())
+
         if "final_info" in infos:
+            for key, total in rew_sums.items():
+                d[f"train_rew/{key}"] = total
+            rew_sums.clear()
             done_mask = infos["_final_info"]
             for k, v in infos["final_info"]["episode"].items():
                 d[f"train/{k}"] = v[done_mask].float().mean()

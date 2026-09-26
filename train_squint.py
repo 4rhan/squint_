@@ -182,17 +182,31 @@ def evaluate(args, eval_envs, get_action_fn, logger, eval_output_dir, max_episod
     # success. Eval envs run ignore_terminations=True by default so the whole batch stays on the
     # same episode for this entire loop, making a plain OR-accumulation safe here.
     stage_flag_keys = ["is_itemB_on_itemC", "is_itemA_grasped", "is_itemA_on_itemB",
-                       "in_bin_ge1", "in_bin_ge2", "in_bin_ge3"]
+                       "in_bin_ge1", "in_bin_ge2", "in_bin_ge3",
+                       # Tower / Rearrange sub-goals
+                       "base_placed", "medium_supported", "small_supported", "buffer_occupied"]
     stage_once = {}
+    # Envs that split their dense reward into info['rew_<term>'] (e.g. TrayPack): sum each term over
+    # the episode (mean over eval envs, raw units) so the eval return can be broken down by term.
+    rew_sums = defaultdict(float)
+    num_correct_max = None
 
     for _ in range(max_episode_steps):
         with torch.no_grad():
             eval_action = get_action_fn(eval_obs['rgb'], eval_obs['state'])
             eval_obs, _, _, _, eval_infos = eval_envs.step(eval_action)
-            for key in stage_flag_keys:
+            for key, val in eval_infos.items():
+                if key.startswith("rew_") and torch.is_tensor(val):
+                    rew_sums[key[4:]] += float(val.float().mean())
+            if "num_correct" in eval_infos:  # Rearrange / TrayPack: objects correctly placed so far
+                nc = eval_infos["num_correct"].float()
+                num_correct_max = nc if num_correct_max is None else torch.maximum(num_correct_max, nc)
+                for k in (1, 2, 3):
+                    eval_infos[f"num_correct_ge{k}"] = eval_infos["num_correct"] >= k
+            for key in stage_flag_keys + ["num_correct_ge1", "num_correct_ge2", "num_correct_ge3"]:
                 if key in eval_infos:
-                    stage_once.setdefault(key, torch.zeros_like(eval_infos[key]))
-                    stage_once[key] |= eval_infos[key]
+                    stage_once.setdefault(key, torch.zeros_like(eval_infos[key], dtype=torch.bool))
+                    stage_once[key] |= eval_infos[key].bool()
             if "final_info" in eval_infos:
                 mask = eval_infos["_final_info"]
                 for k, v in eval_infos["final_info"]["episode"].items():
@@ -203,6 +217,11 @@ def evaluate(args, eval_envs, get_action_fn, logger, eval_output_dir, max_episod
         eval_d[k] = torch.stack(v).float().mean()
     for key, flags in stage_once.items():
         eval_d[f"eval/{key}_once"] = flags.float().mean()
+    for key, total in rew_sums.items():
+        eval_d[f"eval_rew/{key}"] = total
+    if num_correct_max is not None:
+        eval_d["eval/num_correct_max_mean"] = num_correct_max.mean()
+        eval_d["eval/num_correct_end_mean"] = eval_infos["num_correct"].float().mean()
 
     desc = (
         f"success_at_end: {eval_d['eval/success_at_end']:.2f}, "

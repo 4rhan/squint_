@@ -248,6 +248,7 @@ def evaluate(args, eval_envs, get_action_fn, logger, eval_output_dir, max_episod
 
     logger.total_eval_time += eval_time
     logger.log(d=eval_d, step=global_step)
+    return eval_d
 
 
 # ─────────────────────────────────────────────────────────────────────────────

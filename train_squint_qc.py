@@ -127,6 +127,7 @@ if __name__ == "__main__":
 
     run_name = args.exp_name or f"{args.env_id}__qc__{args.seed}__{int(time.time())}"
     model_path = os.path.abspath(f"runs/{run_name}/ckpt.pt")
+    best_path = os.path.abspath(f"runs/{run_name}/ckpt_best.pt")
     os.makedirs(os.path.dirname(model_path), exist_ok=True)
 
     random.seed(args.seed); np.random.seed(args.seed); torch.manual_seed(args.seed)
@@ -205,10 +206,13 @@ if __name__ == "__main__":
                    num_q=args.num_q, q_agg=args.q_agg, gamma=args.gamma, tau=args.tau, lr=args.lr,
                    bc_encoder_grad=args.bc_encoder_grad)
     agent = QCAgent(cfg, n_obs, n_state, n_act, device)
+    ckpt_step = 0
     if args.checkpoint:
         ckpt = torch.load(args.checkpoint, map_location=device)
         agent.load_state_dicts(ckpt)
-        print(f"Loaded checkpoint {args.checkpoint}")
+        ckpt_step = int(ckpt.get("global_step", 0))
+        print(f"Loaded checkpoint {args.checkpoint} (step {ckpt_step}); offline pretraining skipped, "
+              f"online replay and optimizer state start fresh")
     executor = ChunkExecutor(agent, act_scale, act_bias, num_envs=args.num_envs)
     eval_executor = ChunkExecutor(agent, act_scale, act_bias, num_envs=args.num_eval_envs, deterministic=True)
     if args.compile:
@@ -242,6 +246,16 @@ if __name__ == "__main__":
     def save(step):
         if args.save_model:
             torch.save(dict(agent.state_dicts(), global_step=step, horizon=cfg.horizon), model_path)
+
+    best = {"score": None}
+
+    def save_best(eval_d, step):
+        """Keep the best-eval weights in ckpt_best.pt (ckpt.pt is overwritten at every eval). Ranked by
+        success at end, then mean max objects placed (TrayPack/Rearrange), then return."""
+        score = [float(eval_d.get(k, 0.0)) for k in ("eval/success_at_end", "eval/num_correct_max_mean", "eval/return")]
+        if args.save_model and (best["score"] is None or score > best["score"]):
+            best["score"] = score
+            torch.save(dict(agent.state_dicts(), global_step=step, horizon=cfg.horizon, eval=score), best_path)
 
     # ── Offline data + pretraining ─────────────────────────────────────────
     offline = None
@@ -294,7 +308,8 @@ if __name__ == "__main__":
             parts.append(sample_offline(n_off))
         return {k: torch.cat([p[k] for p in parts], 0) for k in parts[0]}
 
-    log_off = args.offline_steps if not args.checkpoint else 0  # keep wandb steps monotonic across phases
+    # keep logged steps monotonic across phases, and continue a resumed run's step count
+    log_off = args.offline_steps if not args.checkpoint else ckpt_step
     obs, _ = train_envs.reset(seed=args.seed)
     eval_envs.reset(seed=args.seed)
     executor.reset()
@@ -307,8 +322,9 @@ if __name__ == "__main__":
     for iteration in range(args.num_total_iterations + 2):
         if args.eval_freq > 0 and ((global_step - args.num_envs) // args.eval_freq) < (global_step // args.eval_freq):
             eval_executor.reset()
-            evaluate(args, eval_envs, eval_executor, logger, eval_output_dir, max_episode_steps, log_off + global_step, pbar)
+            ed = evaluate(args, eval_envs, eval_executor, logger, eval_output_dir, max_episode_steps, log_off + global_step, pbar)
             save(log_off + global_step)
+            save_best(ed, log_off + global_step)
 
         with torch.no_grad():
             env_action = executor(obs['rgb'], obs['state'])  # normalised chunk -> env units

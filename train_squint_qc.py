@@ -38,8 +38,8 @@ class QCArgs(Args):
     agent_name: Optional[str] = "squint_qc"
     exp_name: Optional[str] = None
     """run folder under runs/; default <env_id>__qc__<seed>__<unix time>, so runs never overwrite each other"""
-    num_eval_envs: int = 64
-    """eval episodes per evaluation; with 16, one success moves the rate by 6%, too noisy for these tasks"""
+    num_eval_envs: int = 16
+    """eval episodes per evaluation (one success = 6%; pass 64 for tighter estimates at more memory/time)"""
     gamma: float = 0.9
     """discount per env step (the h-step backup uses gamma**horizon). Squint's tuned value for these
     50-step dense-reward tasks; the official QC's 0.99 targets long sparse-reward OGBench tasks."""
@@ -77,7 +77,8 @@ class QCArgs(Args):
     lr: float = 3e-4
     bc_encoder_grad: bool = True
     reward_version: Optional[int] = None
-    """TrayPack reward version (1 = original, 2 = no dip when placing); None = env default (2).
+    """TrayPack reward version (1 = original, 2 = no dip when placing, 3 = v2 + table contact -0.3 and
+    place paid only for the held cube); None = env default (2).
     The demo file's rewards must come from the same version (examples/relabel_demo_rewards.py)."""
     """BC flow loss also trains the shared image encoder (--no-bc_encoder_grad = old critic-only encoder)"""
 

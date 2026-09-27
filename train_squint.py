@@ -190,6 +190,7 @@ def evaluate(args, eval_envs, get_action_fn, logger, eval_output_dir, max_episod
     # the episode (mean over eval envs, raw units) so the eval return can be broken down by term.
     rew_sums = defaultdict(float)
     num_correct_max = None
+    num_correct_end = []
 
     for _ in range(max_episode_steps):
         with torch.no_grad():
@@ -211,6 +212,10 @@ def evaluate(args, eval_envs, get_action_fn, logger, eval_output_dir, max_episod
                 mask = eval_infos["_final_info"]
                 for k, v in eval_infos["final_info"]["episode"].items():
                     eval_metrics[f'eval/{k}'].append(v[mask])
+                # the envs auto-reset on the last step, so eval_infos["num_correct"] is already the new
+                # episode's (0); the finished episode's count is in final_info
+                if "num_correct" in eval_infos["final_info"]:
+                    num_correct_end.append(eval_infos["final_info"]["num_correct"][mask].float())
 
     eval_d = {}
     for k, v in eval_metrics.items():
@@ -221,7 +226,8 @@ def evaluate(args, eval_envs, get_action_fn, logger, eval_output_dir, max_episod
         eval_d[f"eval_rew/{key}"] = total
     if num_correct_max is not None:
         eval_d["eval/num_correct_max_mean"] = num_correct_max.mean()
-        eval_d["eval/num_correct_end_mean"] = eval_infos["num_correct"].float().mean()
+        if num_correct_end:
+            eval_d["eval/num_correct_end_mean"] = torch.cat(num_correct_end).mean()
 
     desc = (
         f"success_at_end: {eval_d['eval/success_at_end']:.2f}, "

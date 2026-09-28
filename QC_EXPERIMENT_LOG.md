@@ -888,3 +888,27 @@ Decision (user): before fixing Tower3, check that the pipeline trains properly o
   rendering takes ~20% of collection time).
 - Still to check on the box before training: solver success and demo length vs the 50-step limit (earlier clean
   StackCube demos averaged ~51 steps), reward dips, demo/env match, pretraining shows grasping.
+
+### StackCube step 1 (test collection on the box, 12:04): demos don't fit the 50-step limit
+- 20 clean demos, 8 workers (`examples/collect_tp3_recovery.sh` with `ENV_ID=SO101StackCube-v1 REWARD_VERSION=none`,
+  new option: `none` leaves out `--reward-version` for envs without reward versions): 0 saved from 104 attempts,
+  100 rejected as over 50 steps. The run stopped there (merging 0 demos fails), so the recovery half didn't run.
+- Measured with the limit raised to 200 (16 seeds each, `/tmp/stacklen.py` on the box):
+
+| demos | solver success | length min / median / mean / max |
+|---|---|---|
+| clean | 15/16 | 57 / 71 / 70 / 86 |
+| recovery (noise 0.2, miss 0.3) | 14/16 | 61 / 82 / 89 / 153 |
+
+- The scripted StackCube demos are ~70 steps with the current planner (vs ~51 with the older one of 2026-09-24):
+  the grasp retry, jaw-clearance and misaligned-grasp logic added later make the motion slower and more careful.
+  The original Squint RL solves StackCube within 50 steps, so the 50-step limit is feasible for a policy, but our demos
+  can't fit it.
+- Where the ~70 steps go (4 demos, steps per solver phase): reach + descend onto the cube 13–24 (final descent at half
+  speed), close gripper 6 (gripper limit 0.2 rad/step + 3 settle steps), lift + carry + lower 21–29 (lift at 70%,
+  lowering at half speed), pause 2 per placement correction, open gripper 6, back off + stand still 6. A trained policy
+  moves every joint at full speed and overlaps gripper motion with arm motion, so it fits in 50.
+- **Solver `FAST` profile** (`SO101GraspSolver.FAST`, collector `--fast`, off by default so other tasks' demos are
+  unchanged): full-speed descents, lifts and retreats (`DESCENT_SPEED` 0.5 → 1.0, `LIFT_SPEED` 0.7 → 1.0), 1 settle step
+  after gripper moves (`GRIP_SETTLE` 3 → 1) and after placement corrections (`SERVO_SETTLE` 2 → 1). The meta records
+  `fast_solver`. Not measured yet (shell tool unavailable at the time); next: demo lengths with `--fast`, clean and recovery.

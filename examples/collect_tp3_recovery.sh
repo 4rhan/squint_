@@ -22,7 +22,7 @@ WORKERS=${WORKERS:-8}
 START_SEED=${START_SEED:-1000}
 NOISE=${NOISE:-0.2}
 MISS=${MISS:-0.3}
-REWARD_VERSION=${REWARD_VERSION:-3}
+REWARD_VERSION=${REWARD_VERSION:-3}  # "none" for envs without reward versions (e.g. SO101StackCube-v1)
 MAX_ATTEMPTS=${MAX_ATTEMPTS:-$((N * 5))}  # ~40% of TrayPack3 recovery attempts succeed
 OUT=${OUT:-demos/qc/SO101TrayPack3-recovery.h5}
 LOG=${LOG:-logs/collect_tp3_recovery.log}  # logs/ is git-ignored
@@ -37,6 +37,8 @@ NUM_LAYERS=${NUM_LAYERS:-4}
 TRAIN_ARGS=${TRAIN_ARGS:-}
 
 cd "$(dirname "$0")/.."
+if [ "$REWARD_VERSION" = none ]; then RV_COLLECT=(); RV_TRAIN=(); else
+    RV_COLLECT=(--reward-version "$REWARD_VERSION"); RV_TRAIN=(--reward_version "$REWARD_VERSION"); fi
 mkdir -p "$(dirname "$LOG")" "$(dirname "$OUT")" logs
 
 if [ "$SKIP_COLLECT" != 1 ]; then
@@ -49,7 +51,7 @@ if [ "$SKIP_COLLECT" != 1 ]; then
     (
         echo 1000 > /proc/self/oom_score_adj
         exec python -m examples.collect_new_tasks_demos -e "$ENV_ID" -n "$N" --workers "$WORKERS" \
-            --start-seed "$START_SEED" --max-attempts "$MAX_ATTEMPTS" --reward-version "$REWARD_VERSION" \
+            --start-seed "$START_SEED" --max-attempts "$MAX_ATTEMPTS" "${RV_COLLECT[@]}" \
             --action-noise "$NOISE" --miss-prob "$MISS" -o "$OUT"
     ) 2>&1 | tee "$LOG"
 fi
@@ -59,7 +61,7 @@ python -m examples.verify_demos "$OUT" --no-replay 2>&1 | tail -5 | tee -a "$LOG
 if [ "$TRAIN" = 1 ]; then
     echo "training $EXP_NAME on $OUT (log: logs/$EXP_NAME.log)"
     # shellcheck disable=SC2086
-    python train_squint_qc.py --env_id "$ENV_ID" --demo_path "$OUT" --reward_version "$REWARD_VERSION" \
+    python train_squint_qc.py --env_id "$ENV_ID" --demo_path "$OUT" "${RV_TRAIN[@]}" \
         --gamma 0.99 --no-env_domain_randomization --horizon 5 \
         --offline_steps "$OFFLINE_STEPS" --hidden_dim "$HIDDEN_DIM" --num_layers "$NUM_LAYERS" \
         --exp_name "$EXP_NAME" $TRAIN_ARGS 2>&1 | tee "logs/$EXP_NAME.log"

@@ -58,6 +58,12 @@ class SO101GraspSolver:
     #   shows the miss being detected, the jaws reopening and the retry.
     ACTION_NOISE = 0.0
     MISS_PROB = 0.0
+    # FAST: move like a trained policy rather than a cautious planner, for short-horizon tasks whose step limit
+    # the default profile overruns (SO101StackCube-v1: ~70 steps vs a 50-step limit). Full-speed descents,
+    # lifts and retreats (default 0.5 / 0.7 / 0.7 of MAX_JOINT_STEP) and 1 settle step after gripper moves and
+    # placement corrections (default 3 and 2). Off by default, so the other tasks' demos are unchanged.
+    FAST = False
+    DESCENT_SPEED, LIFT_SPEED, SERVO_SETTLE = 0.5, 0.7, 2
 
     def __init__(self, env, vis: bool = False):
         self.env = env
@@ -104,6 +110,8 @@ class SO101GraspSolver:
             self.CONTINUITY_W, self.TILT_W, self.GRIP_SETTLE, self.SERVO_ITERS = 0.6, 1.0, 3, 4
             self.MAX_JOINT_ACCEL = self.MAX_JOINT_STEP  # full speed after one step
             self.APPROACH_H, self.LIFT_H, self.PLACE_APPROACH_H, self.RETREAT_H = 0.035, 0.035, 0.03, 0.04
+        if self.FAST:
+            self.DESCENT_SPEED, self.LIFT_SPEED, self.SERVO_SETTLE, self.GRIP_SETTLE = 1.0, 1.0, 1, 1
         self.fail_reason = None
         self.n_clipped_steps = 0
         self.n_steps = 0
@@ -665,7 +673,7 @@ class SO101GraspSolver:
 
         self.queue(up[-1])
         for q in up[-2::-1]:
-            self.queue(q, speed_scale=0.5)
+            self.queue(q, speed_scale=self.DESCENT_SPEED)
         self.hold(1)  # flushes: the arm comes to rest only here, just before closing
         self.set_gripper(self.g_squeeze)
         grasped = bool(self.agent.is_grasping(actor)[0])
@@ -678,7 +686,7 @@ class SO101GraspSolver:
         lift = self.vertical_path(self._commanded_arm(), self.held_frame(self._commanded_arm())[0],
                                   lift_height, held=True)
         for q in lift[1:]:
-            self.queue(q, speed_scale=0.7)
+            self.queue(q, speed_scale=self.LIFT_SPEED)
         return grasped
 
     def place(self, actor, target_center, face_axes=None, jaw_perp=None, release_height=0.005,
@@ -718,14 +726,14 @@ class SO101GraspSolver:
 
         self.queue(down[-1])
         for q in down[-2::-1]:
-            self.queue(q, speed_scale=0.5)
+            self.queue(q, speed_scale=self.DESCENT_SPEED)
         self.hold(1)  # flushes lift + carry + descent as one motion
         self._servo_held(actor, self.held_frame(q_place)[0], face_axes)
         self.set_gripper(self.gripper_qpos_for_gap(2 * self.half + release_gap))
         q_now = self._commanded_arm()
         fk = self._fk(q_now, self.gripper_target, ("gl",))
         # queued, so it blends into whatever comes next (next pick / final rest)
-        self.queue(self._retreat_ik(q_now, fk["gl"][0] + [0, 0, retreat_height]), speed_scale=0.7)
+        self.queue(self._retreat_ik(q_now, fk["gl"][0] + [0, 0, retreat_height]), speed_scale=self.LIFT_SPEED)
         self._place_jaw_perp = None
         return True
 
@@ -757,7 +765,7 @@ class SO101GraspSolver:
                 if float(np.max(np.abs(q - cur))) < 0.008:
                     break
                 self._step(q, self.gripper_target, noise=False)
-            self.hold(2)
+            self.hold(self.SERVO_SETTLE)
         err = actor.pose.sp.p - goal
         self.last_place_err = float(np.linalg.norm(err))
 

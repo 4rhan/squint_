@@ -1025,3 +1025,79 @@ evals (every 10k steps). Does pretraining alone now stack?
   - (a) The Q term (α = 100) pushes the one-step actor off the demo manifold offline, where the critic's errors are unchecked.
   - (b) A gap between the demos (CPU sim) and eval (GPU sim, rendering).
   - Diagnostic to separate them: evaluate the BC-flow policy alone (no Q) from the checkpoint. If BC alone grasps, it's (a); if not, it's (b) or imitation.
+
+### 16:40: `stack_fast500` stopped by the user; result
+- **The run had reached 1.5M steps** (500k offline + 1M online), so it was complete, or within one eval of the end, when the tmux session was killed.
+- **Offline, 0–500k:**
+  - Grasp 0–0.19, success 0 (only 1/16 once, at 90k).
+  - Return about −10 from 130k on.
+  - Pretraining for longer did not help.
+- **Online, 500k–1.5M:**
+  - Grasp rises fast: 0.31 → 0.75 → 0.94.
+  - A-on-B 0–0.12, success at end 0–0.06; return +12…14.
+  - This matches `stack_fast100`: 5× the demos plus 10× the pretraining gave no better stacking.
+- **Conclusion:**
+  - The offline phase fits the clean demos (losses fall as expected) but doesn't generalize closed-loop.
+  - Online learns to grasp, but the place-and-release (stack) step isn't being learned in 1M steps.
+- **Next candidates:**
+  - Recovery demos (noise/miss) for StackCube.
+  - Shorter offline phase (≤100k).
+  - Held-out BC loss to measure overfitting.
+  - Look at the eval videos to see *how* stacking fails (drops, misaligned, never releases).
+- **Checkpoints:**
+  - `runs/stack_fast500/ckpt_best.pt` (16:21)
+  - `runs/stack_fast500/ckpt.pt` (16:36)
+
+---
+
+## 2026-09-28 (22:45) — LiftCube QC-FQL for real-robot deployment: setup (nothing run on the box yet)
+
+Goal: a QC-FQL LiftCube policy that runs on the real SO101 through `deploy.py`.
+
+Code (uncommitted):
+- `examples/collect_new_tasks_demos.py`: `SO101LiftCube-v1` added (existing `solutions/lift_cube.py` solver: pick the
+  cube, go back to the rest pose, hold 2 steps).
+- `train_squint_qc.py`: checkpoints also store `cfg` (the full `QCConfig`), `image_size`, `env_id`, `control_mode`.
+- `qc_agent.py`: `QCDeployAgent` (same interface as `train_squint.DeployAgent`: area-downsample to the training size,
+  deterministic one-step policy, chunk played open loop, re-query after `exec_steps`, output in env units, shape
+  [1, 6]) and `config_from_checkpoint` (reads `cfg`, or infers net sizes from the weight shapes for older checkpoints).
+- `deploy.py`: `--agent_type qc` (local `--checkpoint` required) and `--qc_exec_steps`; `agent.reset()` at every
+  episode start so a new episode doesn't continue the old chunk.
+- New `examples/run_lift_qc.sh`: collect → static check → train, one job at a time. **Domain randomization on** for
+  demos, training and eval (Squint's sim2real setup: camera pose/FOV noise, 5° joint-reading noise, cube 22–28 mm,
+  friction 0.1–0.5, plus color jitter). All previous QC runs used `--no-env_domain_randomization`, which would not
+  transfer. Defaults: 200 clean `--fast` demos (seeds 3000+), 50k offline, 1.5M online, gamma 0.9 (Squint's for
+  50-step tasks), 512×4, h=5, 16 px, eval seed 100, `--no-cudagraphs` (the CUDA-graph QC update is still untested
+  on the GPU; compile stays on).
+
+Local checks (CPU):
+- Collection, 6 demos each at seeds 1000+, `--fast`: clean 6/8 attempts saved (1 too long), lengths 26–46; DR 6/8
+  (1 plan failure, 1 too long), lengths 29–46. Both files pass `verify_demos --no-replay` (6/6); DR meta
+  `domain_randomization: true`, state 12-dim, rgb 128 px.
+- `train_squint_qc.py` smoke run on the DR demos (1 CPU env, DR + jitter, 40 offline + 300 online steps, tiny nets):
+  runs end to end, writes `ckpt.pt`, `ckpt_best.pt`, `metrics.jsonl` (deleted afterwards).
+- `QCDeployAgent` on a sim env built exactly like `deploy.py` (128 px, DR off, reward none): loads the checkpoint,
+  5 playback actions == one `act()` chunk (allclose), config inferred from weights == stored config.
+- Not tested: the real robot (no hardware here) and the GPU run.
+
+### 23:05: `deploy.py` kept original; QC deployment moved to `deploy_qc.py`
+- The user wants `deploy.py` to stay Squint's original LeRobot script, so my edits to it were reverted
+  (`git checkout deploy.py`).
+- New `deploy_qc.py` runs the original `deploy.main()` unchanged and swaps two module names it looks up when it runs:
+  - `DeployAgent` → `QCDeployAgent`.
+  - `silent_reset` → the original reset plus a reset of the agent's chunk.
+- Same flags as `deploy.py`, plus `--qc_exec_steps`. It needs a local checkpoint, not wandb.
+- `QCDeployAgent`:
+  - action scale/bias are now buffers, so `agent.to(device)` moves them.
+  - `load_checkpoint()` is a no-op, because the weights are loaded when the agent is built.
+- Test without hardware: a fake LeRobot SO101 (bus, 640×480 camera) and a scripted keyboard, 2 episodes × 12 steps:
+  - policy queried at steps 0/5/10 of each episode (`--qc_exec_steps 2`: every 2 steps);
+  - a new chunk at every episode start (2 agent resets);
+  - actions [1, 6]; 223 commands reached the robot, including the reset moves.
+
+### 23:20: moved to branch `feat/deployment`
+- Branched off `feat/scripted-demos` (3020123), with all uncommitted changes carried over. This branch is for
+  deployment work (QC deploy, the real/sim overlay image, …).
+- To be committed by the user, then pulled on the box to run `bash examples/run_lift_qc.sh` in tmux.
+- `qc_agent.py` / `train_squint_qc.py` also contain the older efficiency edits (compiled / CUDA-graph update, bulk
+  batch sampling). The Lift script runs with compile on and `--no-cudagraphs`.

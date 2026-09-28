@@ -94,4 +94,18 @@ Actions in env units (normalised to [-1,1] on load). rgb is area-resized to `--i
 ```
 python train_squint_qc.py --env_id SO101StackCube-v1 --demo_path demos.h5 --num_envs 256 --horizon 5
 ```
-Not yet supported: `deploy.py` (it only loads Squint's SAC actor).
+
+## Deploy (real robot)
+`deploy_qc.py` runs Squint's original `deploy.py` (LeRobot robot, Sim2RealEnv, keyboard controls, recording,
+`--debug`) unchanged, with two pieces swapped: the agent (`qc_agent.QCDeployAgent`) and the real-robot reset (also
+clears the agent's chunk). Same flags as `deploy.py`, plus `--qc_exec_steps`. Checkpoints store the agent config
+(`cfg`, `image_size`, `env_id`, `control_mode`), so the policy is rebuilt from the file alone (older checkpoints get
+the net sizes from the weight shapes):
+```
+python deploy_qc.py --env_id SO101LiftCube-v1 --checkpoint runs/lift_qc_dr200/ckpt_best.pt
+python deploy_qc.py ... --qc_exec_steps 2   # re-query the policy every 2 steps instead of every chunk
+```
+The deploy agent downsamples the 128 px wrist image to the training size (area, like training), plays each chunk
+open loop and re-queries after `--qc_exec_steps` actions (default: the full chunk, as in training). `--action_scale`
+(default 0.15) still scales every action, as for Squint. Train for deployment with domain randomization on
+(`examples/run_lift_qc.sh`); the TrayPack/Tower/StackCube scripts turn it off.

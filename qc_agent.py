@@ -17,8 +17,10 @@ import copy
 from dataclasses import dataclass
 from typing import Tuple
 
+import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from train_squint import CNNEncoder, Projection
 
@@ -129,7 +131,8 @@ class ChunkCritic(nn.Module):
 
 
 class QCAgent(nn.Module):
-    def __init__(self, cfg: QCConfig, n_obs: Tuple[int, int, int], n_state: int, n_act: int, device):
+    def __init__(self, cfg: QCConfig, n_obs: Tuple[int, int, int], n_state: int, n_act: int, device,
+                 compile: bool = False, cudagraphs: bool = False):
         super().__init__()
         self.cfg = cfg
         self.n_act = n_act
@@ -145,12 +148,30 @@ class QCAgent(nn.Module):
                                        with_time=False)
         self.to(device)
 
+        # capturable Adam keeps its step count on the GPU so an eager CUDA graph can replay it (Squint's rule:
+        # a compiled step handles this itself)
+        cudagraphs = cudagraphs and torch.device(device).type == "cuda"
+        capturable = cudagraphs and not compile
         self.critic_opt = torch.optim.Adam(list(self.critic.parameters()) + list(self.encoder.parameters()),
-                                           lr=cfg.lr)
+                                           lr=cfg.lr, capturable=capturable)
         actor_params = list(self.bc_flow.parameters())
         if cfg.actor_type == "distill-ddpg":
             actor_params += list(self.onestep.parameters())
-        self.actor_opt = torch.optim.Adam(actor_params, lr=cfg.lr)
+        self.actor_opt = torch.optim.Adam(actor_params, lr=cfg.lr, capturable=capturable)
+
+        # One gradient step is a few ms of GPU math split over ~1000 small kernels, so launch overhead
+        # dominates. Critic-only and critic+actor steps are separate functions (a CUDA graph has one fixed
+        # kernel sequence), each optionally compiled and captured as a CUDA graph (as in train_squint.py).
+        # Plain attributes, not a dict, so nn.Module does not try to register them.
+        self._step_critic = lambda b: self._update(b, update_actor=False)
+        self._step_full = lambda b: self._update(b, update_actor=True)
+        if compile:
+            self._step_critic = torch.compile(self._step_critic)
+            self._step_full = torch.compile(self._step_full)
+        if cudagraphs:
+            from tensordict.nn import CudaGraphModule
+            self._step_critic = CudaGraphModule(self._step_critic)
+            self._step_full = CudaGraphModule(self._step_full)
 
     # ------------------------------------------------------------------ acting
     def compute_flow_actions(self, rgb_feat, state, noise):
@@ -192,7 +213,11 @@ class QCAgent(nn.Module):
     # ---------------------------------------------------------------- learning
     def update(self, b, update_actor=True):
         """One gradient step on the critic (+ actor, like acfql's total_loss) from one batch. `b` comes
-        from ChunkBuffer.sample (see qc_data.py)."""
+        from ChunkBuffer.sample (see qc_data.py). With CUDA graphs every call must pass the same keys and
+        shapes, and the returned tensors are copies."""
+        return (self._step_full if update_actor else self._step_critic)(b)
+
+    def _update(self, b, update_actor):
         cfg = self.cfg
         B = b["actions"].shape[0]
         actions = b["actions"].reshape(B, -1)
@@ -248,9 +273,10 @@ class QCAgent(nn.Module):
                 target_a = self.compute_flow_actions(feat, state, noise)
             a_pi = self.onestep(feat, state, noise)
             distill = ((a_pi - target_a) ** 2).mean()
-            self.critic.requires_grad_(False)  # the Q term only moves the policy, not the critic
-            q_loss = -self.critic(feat, state, a_pi.clamp(-1, 1)).mean(0).mean()
-            self.critic.requires_grad_(True)
+            # the Q term only moves the policy, not the critic: call it with detached weights (toggling
+            # requires_grad inside a compiled / graph-captured step is not safe)
+            frozen = {k: v.detach() for k, v in self.critic.named_parameters()}
+            q_loss = -torch.func.functional_call(self.critic, frozen, (feat, state, a_pi.clamp(-1, 1))).mean(0).mean()
         else:
             distill = q_loss = torch.zeros((), device=actions.device)
 
@@ -266,3 +292,72 @@ class QCAgent(nn.Module):
     def load_state_dicts(self, ckpt):
         for k in ("encoder", "critic", "critic_target", "bc_flow", "onestep"):
             getattr(self, k).load_state_dict(ckpt[k])
+
+
+def config_from_checkpoint(ckpt) -> QCConfig:
+    """QCConfig of a saved run. Checkpoints written before the config was stored (no "cfg" key) get the
+    network sizes read off the weight shapes; the flow/actor settings then fall back to the defaults."""
+    if "cfg" in ckpt:
+        return QCConfig(**ckpt["cfg"])
+    flow = [v for k, v in ckpt["bc_flow"].items() if k.startswith("net.net.") and k.endswith(".weight")]
+    critic = [v for k, v in ckpt["critic"].items() if k.startswith("net.") and k.endswith(".weight") and v.dim() == 3]
+    return QCConfig(horizon=int(ckpt["horizon"]), hidden_dim=flow[0].shape[0], actor_layers=len(flow) - 1,
+                    critic_hidden_dim=critic[0].shape[-1], critic_layers=len(critic) - 1,
+                    num_q=critic[0].shape[0])
+
+
+class QCDeployAgent(nn.Module):
+    """QC-FQL policy for deploy_qc.py (same interface as train_squint.DeployAgent): area-downsamples the wrist
+    image to the training size, asks the policy for a chunk and plays it back one action per step (open
+    loop), re-querying after `exec_steps` actions (default: the whole chunk, as in training). Returns
+    actions in env units, like the training ChunkExecutor. Call reset() at the start of every episode."""
+
+    def __init__(self, sim_env, sample_obs, checkpoint, exec_steps=None, device=None):
+        super().__init__()
+        self.device = device or torch.device("cpu")
+        ckpt = torch.load(checkpoint, map_location=self.device)
+        self.cfg = config_from_checkpoint(ckpt)
+        self.image_size = int(ckpt.get("image_size", 16))
+        space = sim_env.unwrapped.single_action_space
+        n_act = int(np.prod(space.shape))
+        c = sample_obs["rgb"].shape[-1]
+        n_state = int(sample_obs["state"].shape[-1])
+        self.agent = QCAgent(self.cfg, (self.image_size, self.image_size, c), n_state, n_act, self.device)
+        self.agent.load_state_dicts(ckpt)
+        self.agent.eval()
+        # buffers, so deploy.py's agent.to(device) moves them with the networks
+        self.register_buffer("scale", torch.as_tensor((space.high - space.low) / 2.0, dtype=torch.float32))
+        self.register_buffer("bias", torch.as_tensor((space.high + space.low) / 2.0, dtype=torch.float32))
+        self.exec_steps = min(exec_steps or self.cfg.horizon, self.cfg.horizon)
+        self.chunk, self.idx = None, 0
+        print(f"Loaded QC checkpoint {checkpoint} (step {ckpt.get('global_step')}, eval {ckpt.get('eval')}): "
+              f"horizon {self.cfg.horizon}, executing {self.exec_steps} per query, {self.image_size}px, "
+              f"{self.cfg.hidden_dim}x{self.cfg.actor_layers} nets, {self.cfg.actor_type}")
+
+    def reset(self):
+        self.chunk, self.idx = None, 0
+
+    def load_checkpoint(self, *args, **kwargs):
+        """No-op: the weights are loaded in __init__ (deploy.main calls this after building the agent)."""
+
+    def downsample_rgb(self, rgb):
+        if rgb.dim() == 3:
+            rgb = rgb.unsqueeze(0)
+        if rgb.shape[-3] == self.image_size:
+            return rgb
+        rgb = F.interpolate(rgb.permute(0, 3, 1, 2).float(), size=(self.image_size, self.image_size), mode="area")
+        return rgb.permute(0, 2, 3, 1).to(torch.uint8)  # same rounding as utils.DownsampleObsWrapper
+
+    @torch.no_grad()
+    def get_action(self, obs):
+        if self.chunk is None or self.idx >= self.exec_steps:
+            state = obs["state"].float()
+            state = state.unsqueeze(0) if state.dim() == 1 else state
+            self.chunk = self.agent.act(self.downsample_rgb(obs["rgb"]), state, deterministic=True)
+            self.idx = 0
+        a = self.chunk[:, self.idx]
+        self.idx += 1
+        return a * self.scale + self.bias  # [1, n_act], like DeployAgent
+
+    def forward(self, obs):
+        return self.get_action(obs)

@@ -40,6 +40,8 @@ class QCArgs(Args):
     """run folder under runs/; default <env_id>__qc__<seed>__<unix time>, so runs never overwrite each other"""
     num_eval_envs: int = 16
     """eval episodes per evaluation (one success = 6%; pass 64 for tighter estimates at more memory/time)"""
+    eval_seed: Optional[int] = None
+    """reset the eval envs to this seed at every eval (same layouts each time); None = new random layouts per eval"""
     gamma: float = 0.9
     """discount per env step (the h-step backup uses gamma**horizon). Squint's tuned value for these
     50-step dense-reward tasks; the official QC's 0.99 targets long sparse-reward OGBench tasks."""
@@ -78,7 +80,7 @@ class QCArgs(Args):
     bc_encoder_grad: bool = True
     reward_version: Optional[int] = None
     """TrayPack reward version (1 = original, 2 = no dip when placing, 3 = v2 + table contact -0.3 and
-    place paid only for the held cube); None = env default (2).
+    place paid only for the held cube; None = env default 2). Tower: 1 = original, 2 = no dips (default 1).
     The demo file's rewards must come from the same version (examples/relabel_demo_rewards.py)."""
     """BC flow loss also trains the shared image encoder (--no-bc_encoder_grad = old critic-only encoder)"""
 
@@ -145,7 +147,8 @@ if __name__ == "__main__":
     if getattr(args, 'stage2_start_prob', 0) > 0:
         env_kwargs["stage2_start_prob"] = args.stage2_start_prob
     if args.reward_version is not None:
-        assert args.env_id.startswith("SO101TrayPack"), "--reward_version is only implemented for TrayPack"
+        assert args.env_id.startswith(("SO101TrayPack", "SO101Tower")), \
+            "--reward_version is only implemented for TrayPack and Tower"
         env_kwargs["reward_version"] = eval_env_kwargs["reward_version"] = args.reward_version
 
     train_envs = gym.make(args.env_id, num_envs=args.num_envs, reconfiguration_freq=args.reconfiguration_freq, **env_kwargs)

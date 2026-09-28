@@ -527,3 +527,364 @@ within ~2 min at the user's request, and its partial files were deleted. Plan to
     18 evals had one). Mostly a 2-cube policy; the third cube is still the bottleneck.
 23. GPU is now free. Next steps (more demos / episode limit / longer pretraining and online, efficiency branch)
     are open for discussion; see the proposal above.
+
+---
+
+## 2026-09-27 (16:10) — Efficiency branch `feat/qc-efficiency`: faster gradient steps, same training
+
+Goal: bring the TrayPack3 run from ~3 h to ~1 h **without** changing offline/online steps, `num_updates`, batch
+size, network size, demos or any hyperparameter. Only how each gradient step runs on the GPU changes.
+
+Diagnosis (from the `tp3_recovery` numbers above): ~112 online and ~89 offline gradient steps/s, i.e. ~9–11 ms per
+step, for 512×4 MLPs at batch 512 on 16 px images. The math for one step is only a few ms. The rest is launch/Python
+overhead of ~1000 small kernels per step (10 flow Euler passes, backward, 2 Adams, target lerp) plus ~40 small
+index kernels per replay sample. `--cudagraphs` (default True in `Args`) was never used by `train_squint_qc.py`,
+unlike `train_squint.py`, which wraps its updates in `CudaGraphModule`.
+
+Changes:
+1. `qc_agent.py`: the update is split into a critic-only step and a critic+actor step. With `--compile` each is
+   `torch.compile`d, and with `--cudagraphs` each is captured by `tensordict.nn.CudaGraphModule`, the same pattern
+   as `train_squint.py` (Adam `capturable = cudagraphs and not compile`). `QCAgent.update(b, update_actor)` keeps its
+   signature.
+2. `qc_agent.py`: the Q term of the actor loss now calls the critic with detached weights
+   (`torch.func.functional_call`) instead of toggling `requires_grad_` inside the step. Same gradients, and it is
+   safe to compile/capture.
+3. `train_squint_qc.py`: the batches for an iteration's 256 updates (and each 256-step offline block) are sampled in
+   one vectorised call, capped at ~256 MB per block, instead of one call per update. The buffers do not change
+   inside the block, so the sampling distribution is the same. Each batch is still `n_on` replay + `n_off` demo samples.
+4. New `examples/bench_qc_update.py`: times eager / compile / compile+graphs updates on synthetic buffers at
+   `tp3_recovery` sizes and projects offline + online update time.
+
+Verification (local, CPU):
+- Eager: new vs old agent, same weights and seeds, 12 mixed critic/actor updates → **bit-identical** parameters
+  (max diff 0.0).
+- Compiled (`fallback_random` so the RNG matches eager): max param diff 2e-5 after 12 updates (fused-kernel rounding).
+- `train_squint_qc.py` CPU smoke run (TrayPack1, 1 env, offline + online updates) runs end to end.
+- Not verified yet: GPU speed-up, CUDA graph capture on the box. Next step on the box:
+  `python -m examples.bench_qc_update` (a few minutes), then a full `tp3_recovery`-identical run with a new
+  `--exp_name` to compare wall-clock time and eval curves.
+
+Not changed: the per-iteration demo re-jitter (a full pass over the demo image store, ~74 torchvision calls per
+iteration) and the evals (16 envs × 300 steps ≈ 24 s each, every 10k offline steps and every 100k online steps,
+~12 min per run in total). Both are next in line if the benchmark shows the updates are no longer the bottleneck.
+
+---
+
+## 2026-09-27 (16:40) — collecting 500 more TrayPack3 recovery demos
+
+On the box after pulling commit `1a76ae1` (tmux `collect2`, log `~/collect_tp3_recovery_b.log`):
+`N=500 WORKERS=8 START_SEED=5000 OUT=demos/qc/SO101TrayPack3-recovery_b.h5 bash examples/collect_tp3_recovery.sh`
+(noise 0.2, miss 0.3, reward v3, 300-step horizon unchanged, max attempts 2500). Seeds start at 5000, so they
+don't overlap the first 300 demos (seeds 1000–~1600). Plan: merge with `SO101TrayPack3-recovery.h5` into
+800 demos (`examples/merge_qc_demos.py`). RAM with 8 workers: ~10.9 GB used / 4.4 GB available.
+
+### Result of the 500-demo collection (checked 21:10)
+- Finished 16:55: 500/500 saved (`demos/qc/SO101TrayPack3-recovery_b.h5`, 326 MB) from 959 attempts (52%;
+  113 rejected for exceeding 300 steps). Length mean 249, min 161, max 300. Seeds 5001–6064, all unique, no overlap
+  with the first file (seeds 1001–1708). Meta: reward v3, noise 0.2, miss 0.3.
+- Full replay verification (`verify_demos --workers 8`): **500/500 passed** (replay reproduces the recording and succeeds).
+- Merged: `demos/qc/SO101TrayPack3-recovery800.h5` = first 300 + these 500 (800 demos, 520 MB, meta reward v3,
+  `merged_from` 2); static check 800/800 passed.
+- The box rebooted at ~18:23 (after collection ended); files unaffected. Disk: 14 GB free.
+
+---
+
+## 2026-09-27 (21:29) — `tp3_rec800`: 800 recovery demos, 200k pretraining, 5M online
+
+**Box environment broke:** someone installed `torch 2.14.0+cu130` into `~/.local` (user site-packages) at 20:41. It shadowed
+the squint env's `torch 2.6.0+cu124`, so importing torchvision 0.21 failed (`RuntimeError: operator torchvision::nms does
+not exist`); the first launch at 21:24 crashed at import. The `~/.local` install was left alone. Instead:
+- Runs use `PYTHONNOUSERSITE=1` (now exported in `examples/collect_tp3_recovery.sh`), so only the conda env is used.
+- The squint env had been relying on `~/.local` for many dependencies. Installed them into the env
+  (`pip check` plus import errors): gymnasium, mpmath, tyro, typing_inspection, annotated_types, networkx, pygments,
+  exceptiongroup, hf-xet, imageio, importlib-resources, jinja2, markdown-it-py, pynput, termcolor. The env now imports
+  `train_squint_qc` on its own: torch 2.6.0+cu124, torchvision 0.21.0, CUDA OK.
+- Logs moved from `~` into the repo's git-ignored `logs/` (30 files). The script now writes collection and verify logs to
+  `logs/` and training logs to `logs/<exp_name>.log`.
+
+**Run** (tmux `tp3rec800`, log `logs/tp3_rec800.log`):
+`TRAIN=1 SKIP_COLLECT=1 OUT=demos/qc/SO101TrayPack3-recovery800.h5 EXP_NAME=tp3_rec800 OFFLINE_STEPS=200000
+TRAIN_ARGS="--total_timesteps 5000000" bash examples/collect_tp3_recovery.sh`, i.e. 800 demos (198,862 steps), 200k offline
+steps, 5M online, 512×4 networks, v3 reward, gamma 0.99, h=5, 16 eval episodes, `ckpt_best.pt` kept.
+Loaded 800 demos, "demo rewards and env both use reward_version 3". ETA: offline ~37 min, online ~2.8 h, done ≈ 01:00.
+Changes vs `tp3_recovery`: 800 instead of 300 demos, 200k instead of 150k offline steps, 5M instead of 1.5M online steps.
+
+`tp3_rec800` at 21:42: offline pretraining 60k/200k (95.6 steps/s, ~24 min left, online starts ≈ 22:07). Offline evals
+10k–50k: 0 cubes (return 3.8–5.7, grasp 0), same as `tp3_recovery` at this stage (it placed 1/16 only at 50k and
+80k–130k). BC flow loss 0.28 at 60k (`tp3_recovery` ended offline at 0.24; more varied data fits more slowly),
+critic loss 0.53, Q mean 79.
+
+`tp3_rec800` at 22:16: offline pretraining finished (200k steps, ~45 min incl. evals); online started 22:14. The online
+phase has only 36k steps so far (391 env steps/s during warm-up; ETA ≈ 01:45 if it stays at that speed).
+Offline evals (20 × 16 episodes): 1 cube in 1/16 only at 100k; grasp reward 0.1–1.1 at 130k–200k; otherwise 0.
+**Pretraining on 800 demos wasn't better than on 300** (`tp3_recovery` placed 1/16 at 4 offline evals: 50k, 80k, 90k,
+130k). Pretraining alone stays a weak prior at 16×16 regardless of demo count (so far); the comparison that matters
+is how fast the online phase takes off.
+
+### Offline phase: 800 vs 300 recovery demos (matched steps, 16 eval episodes each)
+
+| | 300 demos (`tp3_recovery`) | 800 demos (`tp3_rec800`) |
+|---|---|---|
+| evals with ≥1 cube (10k–150k) | 5/15 (1/16 each) | 1/15 (1/16 at 100k); 0 more at 160k–200k |
+| mean eval return (10k–150k) | 6.49 | 5.24 |
+| mean grasp reward (10k–150k) | 1.05 | 0.09 |
+| mean reach reward (10k–150k) | 77.2 | 69.4 |
+| BC flow loss @50k / 100k / 150k | 0.261 / 0.265 / 0.240 | 0.282 / 0.273 / 0.273 (0.256 @200k) |
+| critic loss @50k / 100k / 150k | 0.438 / 0.286 / 0.235 | 0.561 / 0.365 / 0.343 (0.298 @200k) |
+
+24. **Offline pretraining on 800 demos is slightly worse than on 300, not better.** Likely reason: the same batch size
+    (512) spread over 2.7× more data means fewer passes over each demo. At 150k steps: 300 demos (74k steps) ≈ 1,040
+    passes, 800 demos (199k steps) ≈ 390 passes; even 200k steps ≈ 515. BC and critic losses are still higher than the
+    300-demo run's at every matched step, so the 800-demo model is under-fitted, not saturated. Matching the 300-demo
+    run's passes would need ~400k offline steps (~75 min).
+25. Both are weak priors either way (at most 1/16 episodes with a cube). The difference is small (4 extra 1/16
+    episodes) and within 16-episode noise, but the losses point the same way.
+
+### Online phase: 800 vs 300 demos at matched online steps (22:48, `tp3_rec800` at 723k/5M online, 392 sps, ETA ≈ 01:50)
+
+| Online step | 300: ≥1 cube | 300: ≥2 | 300: 3 | 300: mean max cubes | 800: ≥1 cube | 800: ≥2 | 800: 3 | 800: mean max cubes |
+|---|---|---|---|---|---|---|---|---|
+| 100k | 0.19 | 0.06 | 0 | 0.25 | 0.19 | 0.00 | 0 | 0.19 |
+| 200k | 0.31 | 0.00 | 0 | 0.31 | 0.38 | 0.00 | 0 | 0.38 |
+| 300k | 0.25 | 0.06 | 0 | 0.31 | 0.31 | 0.00 | 0 | 0.31 |
+| 400k | 0.25 | 0.12 | 0 | 0.38 | **0.62** | 0.06 | 0 | **0.69** |
+| 500k | **0.69** | 0.06 | 0 | **0.75** | 0.38 | 0.00 | 0 | 0.38 |
+| 600k | **0.75** | **0.31** | 0 | **1.06** | 0.56 | 0.12 | 0 | 0.69 |
+| 700k | **0.69** | **0.31** | 0 | **1.00** | 0.50 | 0.12 | **0.06** | 0.69 |
+
+Training rollouts (stochastic policy, many envs, far less noisy than the eval): return at ~306k online 21.0 (300) vs
+22.4 (800); at ~613k 31.5 (300) vs 35.4 (800).
+
+26. **No clear winner yet.** 800 demos was ahead at 200k–400k and behind at 500k–700k on the 16-episode eval, while the
+    much larger training-rollout sample is slightly ahead for 800. With 16 episodes one episode is 0.06, and swings of
+    ±0.2 between neighbouring evals were normal in the 300-demo run, so these differences are within noise.
+27. 800 demos got its first full 3-cube success at 700k online steps; the 300-demo run's first was at 1.5M.
+    That's one episode, so it's only a hint.
+28. Decision: not clearly worse, so the run continues to 5M (the 400k-offline restart is on hold). The next comparison
+    point is 1–1.5M online steps, where the 300-demo run reached ≥2 cubes 0.31–0.38.
+
+### `tp3_rec800` at 23:42 (1.89M/5M online, ~379 sps, ETA ≈ 01:59): new best, and 800 demos now ahead
+
+| Online step | 300: ≥1 | 300: ≥2 | 300: 3 | 300: max cubes | 800: ≥1 | 800: ≥2 | 800: 3 (= success at end) | 800: max cubes |
+|---|---|---|---|---|---|---|---|---|
+| 800k | 0.81 | 0.25 | 0 | 1.06 | 0.69 | 0.25 | 0 | 0.94 |
+| 900k | 0.81 | 0.31 | 0 | 1.12 | 0.69 | 0.19 | 0 | 0.88 |
+| 1.0M | 0.75 | 0.00 | 0 | 0.75 | 0.69 | 0.38 | 0.06 | 1.12 |
+| 1.1M | 0.56 | 0.06 | 0 | 0.62 | 0.88 | 0.38 | 0 | 1.25 |
+| 1.2M | 0.56 | 0.12 | 0 | 0.69 | 0.62 | 0.12 | 0 | 0.75 |
+| 1.3M | 0.69 | 0.00 | 0 | 0.69 | 0.88 | 0.19 | 0 | 1.06 |
+| **1.4M** | 0.81 | 0.31 | 0 | 1.12 | 0.75 | 0.38 | **0.12** | 1.25 |
+| 1.5M | 0.62 | 0.12 | 0 | 0.75 | **0.94** | 0.38 | 0.06 | **1.38** |
+| 1.6M* | 0.81 | 0.12 | 0 | 0.94 | 0.69 | 0.19 | 0 | 0.88 |
+| 1.7M* | 0.44 | 0.12 | 0 | 0.56 | 0.50 | 0.12 | 0.06 | 0.69 |
+| 1.8M* | 0.50 | 0.06 | 0 | 0.56 | 0.81 | 0.06 | 0 | 0.88 |
+
+\* The 300-demo numbers after 1.5M online come from `tp3_recovery_cont` (the resumed run, which had its restart dip), so
+the comparison there isn't like-for-like.
+
+29. **New best TrayPack3 result: 2/16 full successes (3 cubes, held to the end) at 1.4M online steps**, the first eval of
+    any run above 1/16. `ckpt_best.pt` = this eval (success at end 0.125, 1.25 mean max cubes, return 71.4).
+    Also ≥1 cube 0.94 at 1.5M, the highest yet.
+30. **Averaged over 700k–1.5M (9 evals each, same online steps, both uninterrupted), 800 demos is ahead:** ≥2 cubes 0.27
+    vs 0.16, mean max cubes 1.04 vs 0.87, full-success episodes 5 vs 0 (of 144 each). Averaging many evals reduces the
+    16-episode noise; this is the first clear evidence that more demos help.
+31. Training rollouts keep improving (return 48 → 59 → 62 at 1.1M → 1.7M → 2.0M logger steps, success_once ~1%).
+    Critic loss is stable at 3.7–5.4.
+32. The third cube is still the bottleneck (≤ 2/16), and evals still swing a lot (e.g. 1.5M → 1.7M: max cubes 1.38 → 0.69).
+
+### `tp3_rec800` stopped at 00:57 (2026-09-28), 3.48M/5M online steps: plateau
+
+Last evals (online step: ≥1 / ≥2 / 3 cubes / mean max cubes): 2.2M 1.00/0.31/0.06/1.38; 2.7M 0.88/0.44/0.06/1.38;
+3.0M 1.00/0.31/0/1.31; 3.2M 0.88/0.44/0.06/1.38; 3.4M 0.69/0.31/0/1.00.
+
+Window averages (reduce 16-episode eval noise):
+
+| Online steps | evals | ≥1 cube | ≥2 cubes | 3 cubes | success at end | mean max cubes |
+|---|---|---|---|---|---|---|
+| 0.7–1.5M | 8 | 0.71 | 0.25 | 0.031 | 0.031 | 0.99 |
+| 1.5–2.5M | 10 | 0.81 | 0.24 | 0.019 | 0.013 | 1.07 |
+| 2.5–3.4M | 10 | 0.87 | 0.26 | 0.019 | 0.019 | 1.15 |
+
+Training rollouts: return 62.5 (2.35M logger) → 66.9 → 67.7 → 67.7 → 68.4 (3.58M), success_once 1–2%; critic loss 4.6–6.9.
+
+33. **Plateau:** the first cube keeps improving slowly (0.71 → 0.87), but the second (~0.25) and third (~0.02) cubes have
+    been flat for ~2M online steps, and training return has stalled at ~68 since ~2.6M logger steps. More online steps
+    at these settings won't finish the task; something about the later stages has to change.
+34. Checkpoints: `runs/tp3_rec800/ckpt_best.pt` = 1.4M online (2/16 full successes, 1.25 mean max cubes, return 71.4);
+    `ckpt.pt` = 3.4M online (last eval).
+35. Best TrayPack3 result so far: `tp3_rec800` 1.4M, success at end 0.125 (2/16). Needs re-evaluation on many fixed-seed
+    episodes before it goes in the paper.
+
+Open questions for the next step (not started):
+- Why the second and third cube stall: look at eval videos of the late policy (where does it fail after cube 1: grasp,
+  transport, placement next to an already-placed cube, or running out of time with the 300-step horizon?).
+- Candidates: episode limit 300 → 400; gamma 0.995 (the third cube's reward is ~200 steps away); reward shaping for
+  cubes 2–3; fixed-seed 64-episode evals and a checkpoint re-eval script (see the variance discussion above).
+
+---
+
+## 2026-09-28 (01:30) — next task: Tower3 vs Rearrange3 (same pipeline), pre-check
+
+Test collection on the box: 8 recovery demos each (noise 0.2, miss 0.3, seeds 1000+, 8 workers), current env rewards.
+
+| | SO101Tower3Cube-v1 | SO101Rearrange3-v1 |
+|---|---|---|
+| horizon | 300 | 400 |
+| solver success (recovery) | 8/23 (35%) | 6/50 (12%) |
+| demo length | 229–300 (mean ~263; tight against the 300 limit) | 234–329 |
+| main failures | success check false after stacking (8), pick IK (6) | only 1–2 of 3 correct (17), pick reach/grasp (27) |
+| reward drops > 1 per demo | 2–5 | 1–4 |
+| worst drop (raw) | −2.5 to −3.4 (max reward 15) | −1.6 to −3.1 (max reward 11) |
+
+Replaying demos and inspecting the drop steps (same kinds of problems as TrayPack v1):
+- **Tower, release dip:** releasing a placed cube loses the grasp term (−2) with nothing to replace it (large at base,
+  small on top: −1.99, −1.94).
+- **Tower, flickering stage flags:** `medium_supported` 1→0 after release (−2.5) and `base_placed` 1→0 while carrying
+  (−3.4), so the staged reward briefly takes back a completed stage.
+- **Tower, table contact −3** while approaching the large cube (three −3 drops in one demo), the same penalty that
+  discouraged grasping in TrayPack (v3 reduced it to −0.3).
+- **Rearrange, `num_correct` flicker:** a correctly placed cube briefly counts as not in its pocket (3→2, 2→1, 1→0:
+  −2.6 to −3.1), including right at task completion.
+- **Rearrange, buffer move:** releasing a cube into the buffer loses the +1 grasp bonus (−1, small, by design).
+
+Neither env writes per-term reward info (`rew_*`), so `train_rew/*`/`eval_rew/*` plots won't be available until added.
+
+---
+
+## 2026-09-28 — Tower3 reward v2 (TrayPack-v3-style, no dips)
+
+Decision: Rearrange3 dropped for now (12% solver success with recovery noise, 4 moves incl. buffer). Next task is Tower3,
+so the paper has two long-horizon tasks (TrayPack3 + Tower3).
+
+**Why the v1 reward dips (replaying demos, printing each stage check around the drop steps):**
+- Releasing a placed cube: the grasp term (+2) disappears with nothing in its place (−1.9 to −2.0).
+- `medium_supported` = geometry & (contact force ≥ 0.05 or both cubes still). A resting medium cube presses with only
+  **0.039**, so the check relies on stillness alone, and one velocity blip (0.022 > 0.02) switches the stage off (−2.5).
+- `base_placed` needs the large cube within 4 mm of the table; while it's lowered (held 4–9 mm up) it switches on and off (−3.4).
+- The small cube hovers 7.5 mm above the medium one while held, so it only counts as placed after release, and then
+  nothing pays until the 1 s success dwell finishes.
+- Yaw jitter while a cube is lowered/pressed breaks the 2 mm corner margin of the support check for single steps.
+- Table contact −3.
+
+**Tower reward v2** (`envs/tower.py`, `reward_version=2`; default stays 1 so old runs reproduce):
+- Stage k = cube k placed on its support (large at the tower mark, medium on large, small on medium). The check is
+  geometric only and applies whether held or not, with reward-only tolerances (height ≤ 1 cm, corner margin 5 mm), and a
+  stage counts only if all earlier stages are placed.
+- A placed stage is worth 3, +1 once its cube is released. `reach` (0.5), `grasp` (1) and `place` (1, held cube only)
+  are paid for the first unplaced cube in stack order. So the reward rises through each placement (≤ 2.5 before,
+  ≥ 3 after, 4 when released).
+- Table contact −0.3. Success uses the unchanged strict checks and fills the reward to the max (15). Terms are written to
+  `info["rew_*"]`, so `train_rew/*` and `eval_rew/*` are logged like TrayPack.
+- `_support_check` got optional `z_tol` / `margin` arguments (defaults unchanged). `train_squint_qc.py --reward_version`
+  now also accepts Tower.
+
+**Check** (Tower3 recovery demos, noise 0.2, miss 0.3):
+
+| | reward drops > 1 per demo | worst drop |
+|---|---|---|
+| v1, 8 demos | 2–5 | −2.5 to −3.4 |
+| v2 (2 mm margin), 8 demos recorded with v2 | 0 in 6, 1 in 2 | −6.0 (one-step yaw flicker), −2.85 |
+| **v2 final (5 mm margin), the same 8 + the 8 v1 demos re-scored by replay** | **0 in 16** | **−0.98** |
+
+Next: collect 800 Tower3 recovery demos with `--reward-version 2`.
+
+---
+
+## 2026-09-28 (01:39) — two-task protocol started: TrayPack3 + Tower3 (`examples/run_two_task_qc.sh`)
+
+Same settings for both tasks: 500 recovery demos, 250k offline steps (≈1,000 passes over 500 demos, like the 300-demo run
+that fitted well), **2M online steps**, 16 eval episodes at **fixed eval seed 100** (same layouts at every eval),
+512×4 networks, gamma 0.99, h=5, 16×16 images. TrayPack3: reward v3, the first 500 demos of
+`SO101TrayPack3-recovery800.h5` (`--max_demo_trajs 500`). Tower3: reward v2, 500 new demos (seeds 1000+) collected on
+3 workers while TrayPack3 trains; Tower3 trains after both finish. ETA ≈ 2h10 per task.
+
+Started on the box in tmux `twotask`: `bash examples/run_two_task_qc.sh` (logs: `logs/run_two_task_qc.out`,
+`logs/tp3_500.log`, `logs/collect_tower3_recovery500.log`, later `logs/tower3_500.log`; runs `runs/tp3_500`, `runs/tower3_500`).
+
+Code for this protocol (uncommitted):
+- `train_squint_qc.py --eval_seed`; `train_squint.py` `evaluate()` resets the eval envs with it. Checked on the GPU sim:
+  the same seed gives identical layouts for both tasks (also after stepping), seed 100 ≠ seed 1, and no seed gives
+  random layouts. Seeds 1 and 2 happen to give identical layouts, so 100 is used.
+- `--reward_version` accepted for Tower (`envs/tower.py` v2 above).
+
+Launch problems before this start:
+- 01:32: TrayPack3 crashed at start (`QCAgent.__init__() got an unexpected keyword argument 'compile'`). The laptop's
+  working tree also has the efficiency chat's unfinished edits (`qc_agent.py`, the batched sampling in
+  `train_squint_qc.py`, `examples/bench_qc_update.py`); copying `train_squint_qc.py` to the box brought them along
+  without the matching `qc_agent.py`. The box now runs the committed `train_squint_qc.py` plus only this protocol's
+  edits (eval seed, Tower reward version). The efficiency edits are untested and would confound this comparison.
+- 01:36: relaunched from a script in the git-ignored `logs/`; stopped after ~2 min and moved into the repo as
+  `examples/run_two_task_qc.sh`. Partial outputs of both attempts were deleted.
+- 01:42: the 01:39 start crashed. To check Tower3 training before it runs unattended, I started a small GPU smoke test
+  next to the running TrayPack3 job. RAM ran out, the kernel OOM-killed the smoke test (01:42:45, as intended by its
+  `oom_score_adj` 1000), and one second later TrayPack3 died with a PhysX CUDA error 700 ("illegal memory access").
+  A second GPU sim next to a training run isn't safe; smoke tests only run on an idle box from now on. Log kept in
+  `logs/_failed/tp3_500_physx_crash.log`.
+- Tower3 smoke test on the idle box (8 v2 demos, 16 envs, 4k steps): exit 0, "demo rewards and env both use
+  reward_version 2". Logs `eval/success_*`, `eval/return`, `eval/{base_placed,medium_supported,small_supported}_once`,
+  `eval_rew/{reach,grasp,place,stacked,released,success_bonus,table_pen,total}`; saves `ckpt.pt` + `ckpt_best.pt`.
+- **01:45: restarted cleanly** (tmux `twotask`, `bash examples/run_two_task_qc.sh`). 01:47: TrayPack3 loaded 500 demos
+  (124,067 steps), reward v3 check OK, offline at 111 steps/s; Tower3 collection running on 3 workers. RAM 3.5 GB free,
+  GPU 6.3 GB. ETA: TrayPack3 done ≈ 04:00, Tower3 ≈ 06:15 (if collection finishes first).
+- 01:48: the 01:45 start was stopped again at the user's request: **strictly one job at a time** on the box (collect the
+  demos first, then train), which is safer for the GPU. `examples/run_two_task_qc.sh` rewritten to be sequential:
+  (1) collect 500 Tower3 demos on 8 workers (skipped if the file exists), (2) train `tp3_500`, (3) train `tower3_500`;
+  it stops if a step fails. Partial outputs of the stopped start were deleted.
+- **01:49: started** (tmux `twotask`). Step 1 running alone: 8 collectors, no training, RAM 5.4 GB free, GPU 3.4 GB
+  (collector rendering). Expected: collection ~40 min, then TrayPack3 ~2h10 (≈ 04:40), then Tower3 ~2h10 (≈ 06:50).
+
+### Results of the two-task protocol (all 3 steps finished: collection 02:19, `tp3_500` 04:32, `tower3_500` 06:42)
+
+(Checked 09:55 over the other box address `sra@10.1.205.86`; that link stalls on outputs larger than ~1 packet, so results
+were pulled in small chunks.)
+
+**`tp3_500`** (TrayPack3, 500 demos, 250k offline, 2M online, fixed eval seed 100, 16 episodes):
+- Offline: 1 cube in 1/16 at 110k, 120k, 150k only (same weak prior as before).
+- Online (≥1 / ≥2 / 3 cubes / mean max cubes): 0.3M 0.44/0/0/0.44; 0.4M 0.75/0.12/0/0.88; 0.6M 0.69/0.25/0.06/1.00;
+  0.8M 0.50/0.06/0.06/0.62 (success at end 0.06); 1.0M 0.75/0.25/0/1.00; 1.2M 0.88/0.25/0.06/1.19 (success at end 0.06);
+  1.8M 0.75/0.31/0/1.06; **2.0M 0.94/0.38/0/1.31 (return 77.3, best of the run)**.
+- Mean of the last 10 evals (1.1–2.0M): ≥1 cube 0.73, ≥2 cubes 0.19, 3 cubes 0.006. `tp3_rec800` over the same
+  online steps: 0.77 / 0.23 / 0.024. Same level: 500 demos didn't move the ceiling (eval layouts differ, fixed vs random).
+  Takes off at 0.3–0.4M like the earlier runs.
+
+**`tower3_500`** (Tower3, reward v2, same settings): **failed, never learned to grasp.**
+- Offline evals: large cube placed 1/16 once (60k); otherwise 0. Online: large cube placed 1/16 at 0.3M, 0.9M, 1.9M and
+  2/16 at 1.6M; medium/small stacked and success 0 throughout. Return 1.7–12 (TrayPack3 reached 77).
+- Eval reward terms: reach 31–49 per episode, **grasp 0.0–0.1**, place/stacked/released 0. The policy moves around but
+  never closes on a cube, from offline pretraining through 2M online steps.
+- Training rollouts (1024 envs, stochastic): return 2.9–4.9, a few chance placements (`train_rew/stacked` up to 20.7 at
+  2.09M), grasp ≤ 1.3 per episode.
+- BC flow loss 0.246 offline / 0.223 online (same as TrayPack3, so the demos are fitted), critic loss 2.1, Q mean 57–73.
+- Unlike TrayPack3, the online phase never discovered grasping; the cause is not known yet (to diagnose next).
+
+### Check: do the Tower3 demos match the training env? (TrayPack3 as control, idle box, `logs/envcheck.txt`)
+
+| | TrayPack3 demos | TrayPack3 train env | Tower3 demos | Tower3 train env |
+|---|---|---|---|---|
+| first-step state (12-d) | [0.01, 0, −0.01, 1.57, −1.56, 1.04] ×2 | [0, 0, −0.01, 1.57, −1.58, 1.04] ×2 | [0, −0.01, −0.01, 1.57, −1.57, 1.05] ×2 | [0, 0, −0.01, 1.57, −1.58, 1.04] ×2 |
+| 16×16 image mean / std | 71.8 / 75.6 | 71.8 / 75.6 | 71.5 / 75.7 | 71.4 / 75.7 |
+| obs shapes | rgb 128² → 16², state 12 | same | same | same |
+| action range | [−1, 1] ×6 | [−1, 1] ×6 | [−1, 1] ×6 | [−1, 1] ×6 |
+
+- Same seed, collector (CPU) vs training env (GPU): the cube layouts differ by 5–15 cm for **both** tasks, so an open-loop
+  replay of the demo actions fails on GPU for both (0/5 each), while on CPU 4/5 succeed for both (the full CPU verifier
+  passed 500/500). This is the known CPU/GPU seeding difference, and it doesn't matter for training: the demos are
+  used as (observation, action) data, not replayed.
+- **Conclusion: the Tower3 demos match the training env exactly as well as the TrayPack3 demos, which train fine.** An
+  env/demo mismatch is ruled out as the cause of the Tower3 failure. Next suspects: the task itself (larger cube needs
+  a wider, more precise grasp at 16×16) and what the policy does with the gripper (to check in the eval videos and
+  the policy's gripper actions vs the demos').
+
+---
+
+## 2026-09-28 (11:30) — plan: sanity check on the original 2-cube `SO101StackCube-v1` first
+
+Decision (user): before fixing Tower3, check that the pipeline trains properly on the original Squint task
+`SO101StackCube-v1` (2 cubes, 22–35 mm, 50-step limit) with 100 demos, then return to our tasks.
+- `examples/collect_new_tasks_demos.py`: `SO101StackCube-v1` added to `SOLVERS`/`SOLVER_MODULES` (existing
+  `solutions/stack_cube.py`).
+- Test collection on the laptop (CPU only, 6 workers) was stopped after 6 min with 0 demos saved: without a GPU the
+  128 px camera is rendered in software, far too slow. **Demo collection has to run on the GPU box too** (there,
+  rendering takes ~20% of collection time).
+- Still to check on the box before training: solver success and demo length vs the 50-step limit (earlier clean
+  StackCube demos averaged ~51 steps), reward dips, demo/env match, pretraining shows grasping.

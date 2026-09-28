@@ -48,6 +48,7 @@ SOLVERS = {
     "SO101TrayPack3-v1": "examples.motionplanning.so101.solutions.tray_pack:solve",
     "SO101Rearrange3-v1": "examples.motionplanning.so101.solutions.rearrange:solve3",
     "SO101Rearrange2-v1": "examples.motionplanning.so101.solutions.rearrange:solve2",
+    "SO101StackCube-v1": "examples.motionplanning.so101.solutions.stack_cube:solve",
 }
 SOLVER_MODULES = {
     "SO101Tower3Cube-v1": "examples.motionplanning.so101.solutions.tower3_cube",
@@ -57,6 +58,7 @@ SOLVER_MODULES = {
     "SO101TrayPack3-v1": "examples.motionplanning.so101.solutions.tray_pack",
     "SO101Rearrange3-v1": "examples.motionplanning.so101.solutions.rearrange",
     "SO101Rearrange2-v1": "examples.motionplanning.so101.solutions.rearrange",
+    "SO101StackCube-v1": "examples.motionplanning.so101.solutions.stack_cube",
 }
 
 

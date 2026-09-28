@@ -27,6 +27,7 @@ MAX_ATTEMPTS=${MAX_ATTEMPTS:-$((N * 5))}  # ~40% of TrayPack3 recovery attempts 
 OUT=${OUT:-demos/qc/SO101TrayPack3-recovery.h5}
 LOG=${LOG:-logs/collect_tp3_recovery.log}  # logs/ is git-ignored
 SKIP_COLLECT=${SKIP_COLLECT:-0}
+FAST=${FAST:-0}  # 1 = policy-like solver speed (--fast), for short step limits such as SO101StackCube-v1's 50
 
 # training (TRAIN=1); extra train_squint_qc.py flags can be appended with TRAIN_ARGS="..."
 TRAIN=${TRAIN:-0}
@@ -39,6 +40,7 @@ TRAIN_ARGS=${TRAIN_ARGS:-}
 cd "$(dirname "$0")/.."
 if [ "$REWARD_VERSION" = none ]; then RV_COLLECT=(); RV_TRAIN=(); else
     RV_COLLECT=(--reward-version "$REWARD_VERSION"); RV_TRAIN=(--reward_version "$REWARD_VERSION"); fi
+if [ "$FAST" = 1 ]; then RV_COLLECT+=(--fast); fi
 mkdir -p "$(dirname "$LOG")" "$(dirname "$OUT")" logs
 
 if [ "$SKIP_COLLECT" != 1 ]; then
@@ -46,7 +48,7 @@ if [ "$SKIP_COLLECT" != 1 ]; then
         echo "$OUT already exists; move it away, set OUT=..., or use SKIP_COLLECT=1" >&2
         exit 1
     fi
-    echo "collecting $N $ENV_ID demos (noise $NOISE, miss $MISS, reward v$REWARD_VERSION) on $WORKERS workers -> $OUT"
+    echo "collecting $N $ENV_ID demos (noise $NOISE, miss $MISS, reward v$REWARD_VERSION, fast $FAST) on $WORKERS workers -> $OUT"
     # subshell: only the collectors get the high OOM score, not the training run below
     (
         echo 1000 > /proc/self/oom_score_adj

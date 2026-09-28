@@ -15,6 +15,7 @@ Usage:
   python -m examples.verify_demos demos/qc/*.h5 --workers 16
   python -m examples.verify_demos demos/qc/SO101Rearrange3-v1.h5 --no-replay     # static checks only
   python -m examples.verify_demos demos/qc/SO101TrayPack3-v1.h5 --video demo_videos  # + one mp4 per demo
+  python -m examples.verify_demos demos/qc/SO101TrayPack3-v1.h5 --video demo_videos --limit 10  # first 10 only
 
 --video writes <dir>/<env_id>_traj<i>_seed<s>_{PASS,FAIL}.mp4: the scene camera during the
 replay next to the recorded wrist image, with step / reward / success overlaid.
@@ -50,16 +51,23 @@ def static_checks(g, meta, act_low, act_high):
     term = g["terminated"][()]
     if not term[-1]:
         errs.append("last step is not terminated (success)")
-    elif not term[np.argmax(term):].all():
-        errs.append("terminated flag switches off again after success")
     # The solver's final hold keeps stepping after success, so the episode ends with a
     # short run of terminated=True steps; valid, but loaders cutting at the first flag drop them.
+    # Success may also switch off and on again before the end (success_flickers): tasks without a
+    # dwell latch, e.g. SO101StackCube-v1 (success needs the robot static, so it is True while the
+    # solver pauses after releasing and False while it backs off). Training ignores terminations
+    # unless --partial_reset, so this is reported as a note, not an error.
     return errs
 
 
 def post_success_steps(g):
     term = g["terminated"][()]
     return int(len(term) - np.argmax(term) - 1) if term.any() else 0
+
+
+def success_flickers(g):
+    term = g["terminated"][()]
+    return bool(term.any()) and not term[np.argmax(term):].all()
 
 
 def _frame(scene, wrist, text):
@@ -136,16 +144,17 @@ def _replay_job(args):
     return replay(*args)
 
 
-def verify(path, do_replay, workers, state_tol, video_dir=None):
+def verify(path, do_replay, workers, state_tol, video_dir=None, limit=None):
     with h5py.File(path, "r") as f:
         meta = json.loads(f.attrs["meta"])
-        names = sorted(f.keys(), key=lambda k: int(k.split("_")[-1]))
+        names = sorted(f.keys(), key=lambda k: int(k.split("_")[-1]))[:limit]
         ci = meta.get("control_info", {})
         low = np.asarray(ci.get("action_low", -1.0)); high = np.asarray(ci.get("action_high", 1.0))
         results = {n: static_checks(f[n], meta, low, high) for n in names}
         seeds = [int(f[n].attrs["seed"]) for n in names]
         lengths = [f[n]["actions"].shape[0] for n in names]
         extra = [post_success_steps(f[n]) for n in names]
+        flicker = sum(success_flickers(f[n]) for n in names)
     dup = {s for s in seeds if seeds.count(s) > 1}
     for n, s in zip(names, seeds):
         if s in dup:
@@ -169,6 +178,9 @@ def verify(path, do_replay, workers, state_tol, video_dir=None):
           f"(horizon {meta.get('horizon')}), replay {'on' if do_replay else 'OFF'}")
     if names:
         print(f"  note: steps recorded after first success: max {max(extra)} (terminated stays True)")
+        if flicker:
+            print(f"  note: success switches off and on again before the end in {flicker} demos "
+                  f"(no dwell latch in this task; ignored by training)")
     for n, errs in bad.items():
         print(f"  FAIL {n} (seed {seeds[names.index(n)]}): " + "; ".join(errs))
     print(f"  => {len(names) - len(bad)}/{len(names)} passed")
@@ -183,10 +195,11 @@ def main():
     p.add_argument("--state-tol", type=float, default=1e-3,
                    help="max allowed |replayed - recorded| joint state (rad)")
     p.add_argument("--video", default=None, metavar="DIR", help="save one mp4 per demo into DIR (needs replay)")
+    p.add_argument("--limit", type=int, default=None, help="only check the first N demos of each file")
     args = p.parse_args()
     if args.video and args.no_replay:
         p.error("--video needs the replay; drop --no-replay")
-    ok = [verify(f, not args.no_replay, args.workers, args.state_tol, args.video) for f in args.files]
+    ok = [verify(f, not args.no_replay, args.workers, args.state_tol, args.video, args.limit) for f in args.files]
     print(f"\n{sum(ok)}/{len(ok)} files fully passed")
     sys.exit(0 if all(ok) else 1)
 

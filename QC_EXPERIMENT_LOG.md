@@ -911,4 +911,117 @@ Decision (user): before fixing Tower3, check that the pipeline trains properly o
 - **Solver `FAST` profile** (`SO101GraspSolver.FAST`, collector `--fast`, off by default so other tasks' demos are
   unchanged): full-speed descents, lifts and retreats (`DESCENT_SPEED` 0.5 → 1.0, `LIFT_SPEED` 0.7 → 1.0), 1 settle step
   after gripper moves (`GRIP_SETTLE` 3 → 1) and after placement corrections (`SERVO_SETTLE` 2 → 1). The meta records
-  `fast_solver`. Not measured yet (shell tool unavailable at the time); next: demo lengths with `--fast`, clean and recovery.
+  `fast_solver`.
+- `--fast` measured by the user on the box (20 clean demos, 8 workers, seeds 1000+): **21 of 51 attempts fit in 50 steps
+  (41%)**, 29 too long; saved demos average 44–48 steps. One worker got 0/15 (all too long), so the saved demos lean
+  toward easy layouts (cubes close to the arm / to each other); the policy is still evaluated on all layouts.
+  Recovery demos (corrections add 10–60 steps) won't fit, so StackCube uses clean fast demos.
+- `examples/collect_tp3_recovery.sh`: `FAST=1` passes `--fast`.
+
+### `stack_fast100`: 100 clean fast StackCube demos, training started 12:31 (box `sra@10.1.205.86`, tmux `stacktrain`)
+- Collection (12:26, tmux `stack100`, 8 workers, no noise/miss, `FAST=1`): 104 saved of 264 attempts (39%), 45–47 steps
+  mean per worker, in ~1 min. `demos/qc/SO101StackCube-fast100.h5` (100 demos, 4,623 steps, max 50).
+- The verifier failed all 100 with "terminated flag switches off again after success": StackCube's success needs the
+  robot static and has no dwell latch, so it's True while the solver pauses after releasing, False while it backs off,
+  and True again at the end. Every demo ends in success, and the full replay (8 workers) reproduced all 100 with no
+  other error. Training ignores terminations (no `--partial_reset`), so `examples/verify_demos.py` now reports this as
+  a note ("success switches off and on again ... in N demos"), not a failure. Re-check: 100/100 passed.
+- No recovery demos for this sanity check (user decision: easy task; corrections wouldn't fit in 50 steps anyway).
+- Training: `TRAIN=1 SKIP_COLLECT=1 ENV_ID=SO101StackCube-v1 REWARD_VERSION=none OUT=demos/qc/SO101StackCube-fast100.h5
+  EXP_NAME=stack_fast100 OFFLINE_STEPS=50000 TRAIN_ARGS="--total_timesteps 1000000 --eval_seed 100"
+  bash examples/collect_tp3_recovery.sh` (16×16, 512×4, gamma 0.99, h=5, 16 eval episodes, fixed eval seed 100).
+  Loaded 100 demos (4,623 steps); offline at ~133 steps/s (~6 min), then 1M online steps (~40 min).
+- 12:42 (134k/1M online, 615 env steps/s, ETA ~13:05, no errors). Evals (16 episodes, seed 100):
+
+| step | success at end | success once | A grasped once | A on B once | return |
+|---|---|---|---|---|---|
+| offline 10k | 0 | 0 | 0.06 | 0 | −6.2 |
+| offline 30k | 0 | 0 | 0.06 | 0 | −5.9 |
+| offline 40k | 0 | 0 | 0.19 | 0 | −2.2 |
+| offline 50k | 0 | 0 | 0 | 0 | −7.1 |
+| online 0.1M | 0 | 0 | 0.38 | 0 | +2.3 |
+
+  Negative returns during pretraining = StackCube's −3/step table-contact penalty (original Squint reward). Grasping
+  rises in the first online eval (0.38).
+- **Finished 13:05 (1M online, no errors).** Eval (16 episodes, seed 100):
+
+| online | success at end | A grasped once | A on B once | return |
+|---|---|---|---|---|
+| 0.2M | 0 | 0.81 | 0 | 7.6 |
+| 0.4M | 0 | 0.94 | 0 | 14.1 |
+| 0.6M | 0.06 | 0.94 | 0.06 | 14.2 |
+| 0.8M | 0.06 | 1.00 | 0.12 | 13.7 |
+| 1.0M | 0 | 1.00 | 0.06 | 14.2 |
+
+  Training rollouts (1024 envs, stochastic): success once 0.2% (0.05M) → 0.7% → 1.5% → 1.9% → 5.3% → 7.8% → **8.3%
+  (0.97M), still rising**; return −2.7 → 14.4; episode length always 50 (the limit). Critic loss 1.7, Q mean 71,
+  BC loss 0.088.
+- Reading: grasping is learned reliably (eval 1.00, unlike Tower3's 0), stacking is only starting (train success 8%,
+  eval 0–12%). The StackCube reward has no holding trap (carrying pays ≤ 5, cube on B 7–8, success 9). Likely
+  limits: (1) 1M online steps isn't enough, since train success was still climbing; (2) the 50-step limit is tight,
+  as the demos themselves need 44–50 steps, so a slightly slower policy runs out of time before releasing;
+  (3) the fast demos only cover layouts the solver finishes in ≤ 50 steps (39% of seeds).
+
+### Next iteration (decided 14:00): scale demos and offline steps together
+Goal: the offline phase itself should produce success, so online RL only refines it. Passes over the demo data per
+offline phase (gradient steps × batch / transitions):
+
+| run | demo transitions | offline steps × batch | passes |
+|---|---|---|---|
+| official QC (OGBench) | ~1,000,000 | 1M × 256 | ~256 |
+| `stack_fast100` | 4,623 | 50k × 512 | ~5,500 (fully fitted: BC loss 0.088) |
+| `tp3_rec800` | 198,862 | 200k × 512 | ~515 (under-fitted; offline 1/15 evals with a cube vs 5/15 for 300 demos) |
+| **next: `stack_fast1000`** | ~46,000 | **150k × 512** | **~1,700** |
+
+"1M offline steps" works in the official setting because the datasets are huge. With 100 demos, more steps only
+memorise the same demos harder. The 800-demo TrayPack run showed the other side: more demos without more offline
+steps under-fits. Plan: 1000 clean fast StackCube demos (seeds 2000+, `N=1000 FAST=1 MAX_ATTEMPTS=4000`,
+`demos/qc/SO101StackCube-fast1000.h5`), 150k offline, 2M online, same settings otherwise. Main readout: the offline
+evals (every 10k steps). Does pretraining alone now stack?
+- 14:00: the box became unreachable (10.1.205.86 "No route to host", 192.168.0.127 timeout), so the collection
+  hasn't started yet.
+
+### 14:47: scaled down to 500 demos (user decision: go step by step)
+- The box was reachable again at `10.1.205.86`. The user also gave the LAN address `192.168.0.179`.
+- Started collecting in tmux `stack500`: `SO101StackCube-v1`, 500 clean fast demos (noise 0, miss 0), seeds from 2000, 8 workers, max 2000 attempts.
+  - Output: `demos/qc/SO101StackCube-fast500.h5`
+  - Log: `logs/collect_stack_fast500.log`
+  - Done marker: `logs/stack500.done`
+- First progress lines: ~44% of attempts fit the 50-step limit, mean length 44–46.
+- Planned next step, once the collection is done and verified: train `stack_fast500` with longer pretraining, 200k offline steps.
+  - That is about 4,400 passes over ~23k transitions (the 100-demo run did about 5,500 passes in 50k steps).
+  - Online: 1M, the same as `stack_fast100`, so the two runs can be compared directly.
+  - `--eval_seed 100`.
+  - Main question: do the offline evals alone show stacking?
+
+### 14:50: 500 demos collected, videos saved, `stack_fast500` training started
+- **Collection:** 500/500 saved and passed the static checks; mean length 46, so every demo fits the 50-step limit.
+  - Seeds 2000+.
+  - About 2 of 3 attempts were dropped as `too_long`; only 5 were plan failures.
+- **Demo videos:** the first 10 demos, replayed with `examples/demo_videos.sh`.
+  - New `--limit N` flag in `verify_demos.py`.
+  - Videos are on the box in `demo_videos/SO101StackCube-fast500/`; all 10 replays end in success (PASS).
+- **Training:** the user chose 500k offline steps (about 11,000 passes over ~23k transitions, vs ~5,500 for `stack_fast100`).
+  - Online: 1M steps.
+  - `--eval_seed 100`.
+  - tmux session `stacktrain500`.
+  - Log: `logs/stack_fast500.log`
+  - Run dir: `runs/stack_fast500`, with eval videos in `runs/stack_fast500/videos`.
+  - Pretraining runs at ~131 steps/s, so about 65 minutes plus evals.
+
+### 15:25: `stack_fast500` check at 224k/500k offline steps
+- **Offline evals, 16 eps at fixed seeds, every 10k steps:**
+  - Grasp stays at 0–0.19 the whole time; A-on-B is 0–0.06.
+  - The only success is 1/16 at 90k.
+  - Eval return worsens from −1.9 (10k) to about −11…−13 (from 130k on). In SO101StackCube the reward subtracts 6 for robot–table contact and 1 per step while A is not lifted, so the policy increasingly pushes into the table or never lifts.
+- **Same pattern in `stack_fast100` offline** (grasp ≤ 0.19 through 50k); its grasping only came online (grasp 0.375 at 150k).
+  - So with this setup, more demos and more pretraining do **not** produce the offline rise.
+  - Once past ~100k steps, extra passes make things worse, not better.
+- **Checks that are fine:**
+  - Demo rewards are `normalized_dense` like the env: range −0.06…1.0, mean 0.45.
+  - Q ≈ 80, as expected for γ 0.99 with bootstrap at done.
+  - BC flow loss is low (~0.05 in `fast100`).
+- **Suspects:**
+  - (a) The Q term (α = 100) pushes the one-step actor off the demo manifold offline, where the critic's errors are unchecked.
+  - (b) A gap between the demos (CPU sim) and eval (GPU sim, rendering).
+  - Diagnostic to separate them: evaluate the BC-flow policy alone (no Q) from the checkpoint. If BC alone grasps, it's (a); if not, it's (b) or imitation.

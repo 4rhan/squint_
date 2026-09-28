@@ -110,10 +110,11 @@ def load_solver(env_id):
 
 def collect_one(env_id, num_traj, out, start_seed=0, max_attempts=None, render_size=128,
                 domain_randomization=False, control_mode=None, seed_step=1, position=0,
-                action_noise=0.0, miss_prob=0.0, reward_version=None):
+                action_noise=0.0, miss_prob=0.0, reward_version=None, fast=False):
     # set here, not in main(): parallel workers are spawned processes that re-import the module
     from examples.motionplanning.so101.motionplanner import SO101GraspSolver
     SO101GraspSolver.ACTION_NOISE, SO101GraspSolver.MISS_PROB = float(action_noise), float(miss_prob)
+    SO101GraspSolver.FAST = bool(fast)
     solve = load_solver(env_id)
     sol_mod = importlib.import_module(SOLVER_MODULES[env_id])
     env, horizon, actual_dr, actual_ctrl = make_env(
@@ -148,7 +149,7 @@ def collect_one(env_id, num_traj, out, start_seed=0, max_attempts=None, render_s
                     source_domain="sim", obs_layout="flattened rgb(128,H,W,C uint8)+state(12 float32: noisy_qpos6+target_qpos6)",
                     camera="wrist 128px FOV71deg + per-episode pose/FOV noise iff domain_randomization=true",
                     action_noise=float(action_noise), miss_prob=float(miss_prob),
-                    reward_version=getattr(unw, "reward_version", None),
+                    reward_version=getattr(unw, "reward_version", None), fast_solver=bool(fast),
                     note="training controller only (normalized delta @10Hz); clean images, no jitter; "
                          "actions are the executed ones (incl. action_noise)")
         f.attrs["meta"] = json.dumps(meta)
@@ -263,8 +264,12 @@ def main():
     p.add_argument("--reward-version", type=int, default=None,
                    help="TrayPack dense reward version to record (default: the env's default); "
                         "must match train_squint_qc.py --reward_version")
+    p.add_argument("--fast", action="store_true",
+                   help="policy-like solver speed (full-speed descents, short settles; see SO101GraspSolver.FAST), "
+                        "for short step limits such as SO101StackCube-v1's 50")
     args = p.parse_args()
-    extra = dict(action_noise=args.action_noise, miss_prob=args.miss_prob, reward_version=args.reward_version)
+    extra = dict(action_noise=args.action_noise, miss_prob=args.miss_prob, reward_version=args.reward_version,
+                 fast=args.fast)
     ids = sorted(SOLVERS) if args.all else [args.env_id or "SO101Tower3Cube-v1"]
     for eid in ids:
         out = args.out if (args.out and not args.all) else f"{args.outdir}/{eid}.h5"

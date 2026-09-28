@@ -12,6 +12,9 @@
 # kills them rather than a training run. Use <=4 workers while another training run is going (15 GB RAM
 # box); 16 workers has hung before.
 set -euo pipefail
+# use only the conda env's packages: a torch installed into ~/.local (user site) shadows the env's torch and
+# breaks torchvision ("operator torchvision::nms does not exist")
+export PYTHONNOUSERSITE=1
 
 ENV_ID=${ENV_ID:-SO101TrayPack3-v1}
 N=${N:-300}
@@ -22,7 +25,7 @@ MISS=${MISS:-0.3}
 REWARD_VERSION=${REWARD_VERSION:-3}
 MAX_ATTEMPTS=${MAX_ATTEMPTS:-$((N * 5))}  # ~40% of TrayPack3 recovery attempts succeed
 OUT=${OUT:-demos/qc/SO101TrayPack3-recovery.h5}
-LOG=${LOG:-$HOME/collect_tp3_recovery.log}
+LOG=${LOG:-logs/collect_tp3_recovery.log}  # logs/ is git-ignored
 SKIP_COLLECT=${SKIP_COLLECT:-0}
 
 # training (TRAIN=1); extra train_squint_qc.py flags can be appended with TRAIN_ARGS="..."
@@ -34,7 +37,7 @@ NUM_LAYERS=${NUM_LAYERS:-4}
 TRAIN_ARGS=${TRAIN_ARGS:-}
 
 cd "$(dirname "$0")/.."
-mkdir -p "$(dirname "$LOG")" "$(dirname "$OUT")"
+mkdir -p "$(dirname "$LOG")" "$(dirname "$OUT")" logs
 
 if [ "$SKIP_COLLECT" != 1 ]; then
     if [ -e "$OUT" ]; then
@@ -54,10 +57,10 @@ fi
 python -m examples.verify_demos "$OUT" --no-replay 2>&1 | tail -5 | tee -a "$LOG"
 
 if [ "$TRAIN" = 1 ]; then
-    echo "training $EXP_NAME on $OUT (log: $HOME/$EXP_NAME.log)"
+    echo "training $EXP_NAME on $OUT (log: logs/$EXP_NAME.log)"
     # shellcheck disable=SC2086
     python train_squint_qc.py --env_id "$ENV_ID" --demo_path "$OUT" --reward_version "$REWARD_VERSION" \
         --gamma 0.99 --no-env_domain_randomization --horizon 5 \
         --offline_steps "$OFFLINE_STEPS" --hidden_dim "$HIDDEN_DIM" --num_layers "$NUM_LAYERS" \
-        --exp_name "$EXP_NAME" $TRAIN_ARGS 2>&1 | tee "$HOME/$EXP_NAME.log"
+        --exp_name "$EXP_NAME" $TRAIN_ARGS 2>&1 | tee "logs/$EXP_NAME.log"
 fi

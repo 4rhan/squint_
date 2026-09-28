@@ -93,6 +93,8 @@ class TowerBase(DefaultCameraEnv):
         min_tower_clearance: float = 0.07,  # large cube initial dist from tower
         min_obj_separation: float = 0.055,  # center distance for initial cubes
         max_reach_radius: float = 0.38,
+        # Dense reward variant (see compute_dense_reward): 1 = original, 2 = no dips.
+        reward_version: int = 1,
         **kwargs,
     ):
         if robot_uids == "so100":
@@ -127,6 +129,8 @@ class TowerBase(DefaultCameraEnv):
         self.min_tower_clearance = min_tower_clearance
         self.min_obj_separation = min_obj_separation
         self.max_reach_radius = max_reach_radius
+        assert reward_version in (1, 2), reward_version
+        self.reward_version = reward_version
 
         super().__init__(
             *args, robot_uids=robot_uids, control_mode=control_mode,
@@ -390,7 +394,7 @@ class TowerBase(DefaultCameraEnv):
         return obs
 
     # ------------------------------------------------------------------ checks
-    def _support_check(self, p_top, q_top, half_top, p_bot, q_bot, half_bot):
+    def _support_check(self, p_top, q_top, half_top, p_bot, q_bot, half_bot, z_tol=None, margin=0.002):
         """Orientation-aware support for unequal cubes.
 
         Requires: (a) all 4 bottom corners of the top cube fall inside the
@@ -416,12 +420,11 @@ class TowerBase(DefaultCameraEnv):
         sb = torch.sin(-yaw_bot).unsqueeze(1)
         lx = rel[:, :, 0] * cb - rel[:, :, 1] * sb
         ly = rel[:, :, 0] * sb + rel[:, :, 1] * cb
-        margin = 0.002
         allow = half_bot.unsqueeze(1) + margin
         xy_ok = ((lx.abs() <= allow) & (ly.abs() <= allow)).all(dim=1)
         expected_dz = half_top + half_bot
         z_gap = torch.abs((p_top[:, 2] - p_bot[:, 2]) - expected_dz)
-        z_ok = z_gap <= self.support_z_tol
+        z_ok = z_gap <= (self.support_z_tol if z_tol is None else z_tol)
         xy_dist = torch.linalg.norm((p_top - p_bot)[:, :2], dim=1)
         return xy_dist, z_gap, xy_ok & z_ok, z_ok
 
@@ -519,6 +522,8 @@ class TowerBase(DefaultCameraEnv):
 
     # ------------------------------------------------------------------ reward
     def compute_dense_reward(self, obs: Any, action: torch.Tensor, info: dict):
+        if self.reward_version >= 2:
+            return self._dense_reward_v2(info)
         # Staged reaching/placing reward, monotonic-ish, state-based (no
         # repeatable event bonuses, so cycling cannot farm reward).
         tcp = self.agent.tcp_pose.p
@@ -562,6 +567,80 @@ class TowerBase(DefaultCameraEnv):
         reward[info["success"]] = max_r
         # Penalties.
         reward = reward - 3 * self.agent.is_touching(self.table_scene.table).float()
+        return reward
+
+    # Reward-only placement tolerances: a held cube hovers a few mm above its resting height (4-9 mm measured
+    # while lowering), and its yaw jitters while it is lowered or pressed, so the strict checks (4 mm height,
+    # 2 mm corner margin) flicker for single steps during placement. Success still uses the strict checks.
+    REWARD_Z_TOL = 0.01
+    REWARD_XY_MARGIN = 0.005
+
+    def _dense_reward_v2(self, info: dict):
+        """Raw dense reward v2 (max 15 for 3 cubes, 10 for 2), modelled on TrayPack v3. Each term is also
+        written into info as rew_<name> (raw units) so training/eval can log where reward comes from.
+
+        v1 dips at every stage transition (measured on scripted demos, 2-5 drops of 2-3.4 per demo):
+          - releasing a placed cube loses its grasp term (+2) with nothing in its place;
+          - medium_supported needs contact force >= 0.05 or both cubes still, but a resting medium cube
+            presses with ~0.039, so one velocity blip (> 0.02) switches the stage off (-2.5);
+          - base_placed needs the large cube within 4 mm of the table, so while it is lowered (held
+            4-9 mm up) the stage switches on and off (-3.4);
+          - table contact costs -3 (TrayPack showed this stops RL from grasping).
+        v2: stages are cube k placed on its support (large at the tower mark, medium on large, small on
+          medium), geometric only, height within REWARD_Z_TOL, held or not, and counted only if every
+          earlier stage is placed too. A placed stage is worth 3, +1 once its cube is released. reach,
+          grasp and place (held cube only) are paid for the first unplaced cube in stack order, so the
+          reward rises monotonically through each placement (2.5 max before it, >= 3 after, 4 when
+          released). Table contact costs -0.3. Success still uses the strict checks and fills to max.
+        """
+        N, dev = self.num_envs, self.device
+        z = lambda: torch.zeros(N, device=dev)
+        tcp = self.agent.tcp_pose.p
+        cubes = [self.cubeL, self.cubeM] + ([self.cubeS] if self.NUM_CUBES == 3 else [])
+        halves = [self.large_half, self.medium_half] + ([self.small_half] if self.NUM_CUBES == 3 else [])
+        # goal centre of each cube given the current pose of the one below it
+        pL = self.cubeL.pose.p
+        tower = torch.stack([torch.full_like(pL[:, 0], float(self.tower_xy[0])),
+                             torch.full_like(pL[:, 0], float(self.tower_xy[1])), self.large_half], dim=1)
+        goals = [tower]
+        placed = []
+        base_xy = torch.linalg.norm(pL[:, :2] - tower[:, :2], dim=1)
+        base_dz = (pL[:, 2] - self.large_half).abs()
+        placed.append((base_xy <= self.tower_tol_xy) & (base_dz <= self.REWARD_Z_TOL))
+        for k in range(1, self.NUM_CUBES):
+            top, bot = cubes[k], cubes[k - 1]
+            pb = bot.pose.p
+            goals.append(pb + torch.stack([z(), z(), halves[k - 1] + halves[k]], dim=1))
+            _, _, geom, _ = self._support_check(top.pose.p, top.pose.q, halves[k], pb, bot.pose.q, halves[k - 1],
+                                                z_tol=self.REWARD_Z_TOL, margin=self.REWARD_XY_MARGIN)
+            placed.append(geom)
+        terms = dict(reach=z(), grasp=z(), place=z(), stacked=z(), released=z())
+        prefix = torch.ones(N, dtype=torch.bool, device=dev)
+        target_found = torch.zeros(N, dtype=torch.bool, device=dev)
+        for k, cube in enumerate(cubes):
+            grasped = self.agent.is_grasping(cube).float()
+            stage = prefix & placed[k]
+            terms["stacked"] += stage.float() * 3.0
+            terms["released"] += stage.float() * (1 - grasped)
+            # the first unplaced cube in stack order is the one to work on
+            is_target = (~stage) & (~target_found)
+            t = is_target.float()
+            p = cube.pose.p
+            terms["reach"] += t * 0.5 * (1 - torch.tanh(5 * torch.linalg.norm(tcp - p, dim=1)))
+            terms["grasp"] += t * grasped
+            terms["place"] += t * grasped * (1 - torch.tanh(5 * torch.linalg.norm(goals[k] - p, dim=1)))
+            target_found |= is_target
+            prefix = stage
+        reward = sum(terms.values())
+        max_r = 15.0 if self.NUM_CUBES == 3 else 10.0
+        success = info["success"] if "success" in info else torch.zeros(N, dtype=torch.bool, device=dev)
+        terms["success_bonus"] = torch.where(success, max_r - reward, z())
+        reward = torch.where(success, torch.full_like(reward, max_r), reward)
+        terms["table_pen"] = -0.3 * self.agent.is_touching(self.table_scene.table).float()
+        reward = reward + terms["table_pen"]
+        for k, v in terms.items():
+            info[f"rew_{k}"] = v
+        info["rew_total"] = reward
         return reward
 
     def compute_normalized_dense_reward(self, obs: Any, action: torch.Tensor, info: dict):

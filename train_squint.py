@@ -172,7 +172,9 @@ class Args:
 def evaluate(args, eval_envs, get_action_fn, logger, eval_output_dir, max_episode_steps, global_step, pbar):
     torch.cuda.empty_cache()
     stime = time.perf_counter()
-    eval_obs, _ = eval_envs.reset()
+    # eval_seed (train_squint_qc.py): every eval resets to the same seed, so all evals see the same layouts and
+    # differences between evals come from the policy; None = fresh random layouts each eval (original behaviour)
+    eval_obs, _ = eval_envs.reset(seed=getattr(args, "eval_seed", None))
     eval_metrics = defaultdict(list)
 
     # Track task-specific sub-goal flags across the eval rollout (present only on some tasks,

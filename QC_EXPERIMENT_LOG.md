@@ -1101,3 +1101,111 @@ Local checks (CPU):
 - To be committed by the user, then pulled on the box to run `bash examples/run_lift_qc.sh` in tmux.
 - `qc_agent.py` / `train_squint_qc.py` also contain the older efficiency edits (compiled / CUDA-graph update, bulk
   batch sampling). The Lift script runs with compile on and `--no-cudagraphs`.
+
+### 23:22: first launch of `run_lift_qc.sh` on the box failed at import
+- The box repo is now at `~/arhan/squint_`, on branch `feat/deployment`.
+- Collection crashed before collecting anything: `ModuleNotFoundError: No module named 'typing_extensions'`
+  (imported by torch). This is the same `PYTHONNOUSERSITE=1` issue as on 2026-09-27: the squint env was using a
+  copy from `~/.local`.
+- Fix: `PYTHONNOUSERSITE=1 python -m pip install typing_extensions`, then an import check of the whole chain before
+  relaunching.
+
+### 23:40: Lift demos collected on `omen`; env fixed; training not started yet
+- Box `omen` (sra@192.168.0.181, repo `~/arhan/squint_`, branch `feat/deployment` @ 11a1e14): 62 GB RAM, GPU idle.
+- **Collection** (23:26–23:27, 8 workers, DR on, `--fast`, seeds 3000+): 200/200 saved from 325 attempts (62%);
+  failures 95 plan failures + 30 too long (> 50 steps). Mean length 37, max 50. `verify_demos`: 200/200 passed.
+  File: `demos/qc/SO101LiftCube-dr-fast200.h5`.
+- **Training** crashed at import: `No module named 'click'` (wandb). Installed into the squint env with
+  `PYTHONNOUSERSITE=1 python -m pip install`: click, pydantic, sentry-sdk, platformdirs, hf-xet. `pip check`:
+  no broken requirements. `import torch, wandb, train_squint_qc` OK (torch 2.6.0+cu124, CUDA available).
+- Relaunch (tmux `lifttrain`): left to the user.
+
+### 23:53: `lift_qc_dr200` progress (box `omen`, tmux `lifttrain`, started 23:32 by the user)
+- Offline phase took about 3 min. Online phase runs at ~1,000 env steps/s (1024 envs, `--no-cudagraphs`, compile on;
+  GPU 20 GB, 95 %). ETA for 1.5M online ≈ 00:05.
+- Eval (16 episodes, eval seed 100, DR on; step = offline + online):
+
+| step | success at end | success once | return |
+|---|---|---|---|
+| offline 10k | 0.12 | 0.19 | −22.3 |
+| offline 30k | 0.31 | 0.38 | −8.2 |
+| offline 50k | 0.25 | 0.31 | −8.1 |
+| online 0.10M | 0.12 | 0.19 | 0.8 |
+| online 0.20M | 0.31 | 0.38 | 9.2 |
+| online 0.30M | 0.56 | 0.62 | 15.0 |
+| online 0.40M | 0.69 | 0.69 | 18.2 |
+| online 0.50M | 0.88 | 0.88 | 22.0 |
+| online 0.60M | 0.88 | 0.88 | 23.3 |
+| online 0.70M | 0.88 | 0.88 | 20.7 |
+| online 0.80M | 0.81 | 0.81 | 22.0 |
+
+- Unlike StackCube, the offline phase alone already lifts (up to 5/16). Online RL gets to 14/16 by 0.5M, then
+  plateaus at 0.81–0.88.
+- Training rollouts (stochastic policy, DR + jitter) are lower: success at end ~0.61–0.65. Critic loss 0.04–0.13,
+  Q ≈ 4.3 (γ 0.9), BC flow loss ~0.08.
+- `ckpt_best.pt` was saved at 23:48 (the 0.88 eval).
+
+### 00:15 (2026-09-29): `lift_qc_dr200` finished; deployment-path check in sim
+- Finished at 1.5M online steps (31 min online on `omen`).
+- Evals, online 0.95M → 1.5M: 0.69, 0.75, 0.88, **0.94** (1.25M), 0.88, 0.88, 0.88. Final return 25.1.
+- Training rollouts: success at end 0.75. Critic loss 0.06–0.07, Q 5.6–5.8, BC flow loss 0.07, distill 0.002.
+- `ckpt_best.pt` = the 1.25M-step weights (eval 15/16). Copied to the laptop at `runs/lift_qc_dr200/`.
+- `deploy.py` + `deploy_utils/` are byte-identical to upstream `aalmuzairee/squint` HEAD 7086fd5; the last deploy
+  change upstream is 2a1f6e8 ("fixed --debug flag bug").
+- New `examples/check_deploy_qc.py`: builds the env the way `deploy.py` builds its sim twin (128 px, DR off),
+  runs `QCDeployAgent`, applies deploy's `clip(action * action_scale, -1, 1)`, reports per-episode success, and
+  optionally saves videos (scene + wrist).
+- Results, CPU sim, `ckpt_best.pt`, episodes at seeds 0+:
+
+| action_scale | exec_steps | steps | DR | success at end | once | first success step |
+|---|---|---|---|---|---|---|
+| 1.0 | 5 (full chunk) | 50 | off | **0.95** (19/20; the failure lifted but missed the rest pose) | 0.95 | 22 |
+| 1.0 | 5 | 50 | on | 0.80 (10 eps) | 1.00 | 28 |
+| 0.45 | 5 | 150 | off | 0.60 | 0.70 | 59 |
+| 0.15 | 5 | 350 | off | **0.10** | 0.20 | 161 |
+| 0.15 | **1** | 350 | off | **1.00** | 1.00 | 165 |
+
+- **Finding:** scaling the actions down while still playing the whole 5-action chunk open loop breaks the policy
+  (0.15 → 1/10). Each chunk was planned for full-size steps, so a scaled chunk under-moves, and the next plan starts
+  from a state the chunk didn't expect. Re-planning every step (`--qc_exec_steps 1`, i.e. execute only the first
+  action of each chunk, receding horizon) makes it robust: 10/10 at scale 0.15.
+- Deployment recommendation for the real arm: `--qc_exec_steps 1` with deploy's default `--action_scale 0.15`
+  (`--control_freq 30`). At that speed a lift takes ~165 steps (≈ 5.5 s), so `--max_episode_steps 300`.
+
+### 01:05: Lift background overlay = photo of the real table; next run `lift_qc_table_dr200`
+- The user uploaded `image.jpeg` to the box repo root: a phone photo of the white/grey table, portrait 598×1280, with
+  a date stamp bottom-left. The env stretches overlays to 128×128, so this image would be squashed ~2×.
+- Saved a centre square crop (rows 341–939, which drops the date stamp) as `envs/lift_overlay.png` (598×598).
+- `envs/lift.py`: `LiftRandomizationConfig.rgb_overlay_path` points to it. Lift only; other tasks keep
+  `black_overlay.png`. It applies with DR on and off, so `deploy.py`'s sim twin and the `--debug` overlay use it too.
+- Checked: wrist images (128 px and the 16 px policy input), DR on/off, seeds 0–2, show the table photo behind the
+  robot and cube. A 2-demo test collection (DR, fast, seed 3000) records it too.
+- `examples/collect_new_tasks_demos.py`: the meta now records `rgb_overlay` (file name).
+- `examples/run_lift_qc.sh` defaults renamed so the black-background demos are never reused:
+  `demos/qc/SO101LiftCube-table-dr-fast200.h5`, run `lift_qc_table_dr200`. All other settings are the same as
+  `lift_qc_dr200` (200 demos, 50k offline, 1.5M online, γ 0.9, 512×4, h 5, eval seed 100).
+- Note: in the 16 px image with DR off, the grey sim arm has little contrast against the light table. DR randomizes
+  the robot color during training.
+
+### 01:06: `lift_qc_table_dr200` started on `omen` (tmux `lifttable`)
+- Changed files copied to the box by scp (not committed): `envs/lift.py`, `envs/lift_overlay.png`,
+  `examples/run_lift_qc.sh`, `examples/collect_new_tasks_demos.py`, `examples/check_deploy_qc.py`. md5sums
+  identical to the laptop. The box GPU env loads the overlay (mean wrist pixel 165 vs dark with the black overlay).
+- Launched `bash examples/run_lift_qc.sh` (logs `logs/run_lift_qc_table.out`, `logs/lift_qc_table_dr200.log`).
+- Collection 01:06–01:07: 200/200 demos, mean length 37, max 50, `verify_demos` 200/200 passed. Meta:
+  `rgb_overlay: lift_overlay.png`, DR true. File: `demos/qc/SO101LiftCube-table-dr-fast200.h5` (7,412 steps).
+- Training started 01:06:55 (offline pretraining). The first run needed ~35 min in total.
+
+### 01:30: black cube for Lift; `lift_qc_table_dr200` is superseded
+- The user's real cube is black. The sim Lift cube was pure red (`colors[:, 0] = 1`; `randomize_item_color` False).
+- `envs/lift.py`: new `LiftRandomizationConfig.cube_gray_range = (0.0, 0.08)`. The cube is RGB grey, drawn per
+  episode from this range with DR (a real black cube looks dark grey under room light), and the midpoint (0.04)
+  without DR. Cans keep their colours; `randomize_item_color` still overrides.
+- Checked: base colour 0.04 (DR off) and random (DR on); wrist renders show a black cube on the table photo; a
+  4-demo test collection (DR, fast, seeds 3000+) saved 4/4 and verified.
+- Note: the extra per-episode random draw shifts the DR episode RNG, so the same seed gives different
+  randomized layouts than in earlier runs.
+- `examples/run_lift_qc.sh` defaults: `demos/qc/SO101LiftCube-table-black-dr-fast200.h5`,
+  run `lift_qc_table_black_dr200`.
+- `lift_qc_table_dr200` (table background, red cube; tmux `lifttable`, started 01:06) no longer matches the real
+  setup. The user will stop it, commit, and start the black-cube run.

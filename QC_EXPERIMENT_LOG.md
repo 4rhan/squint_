@@ -1209,3 +1209,32 @@ Local checks (CPU):
   run `lift_qc_table_black_dr200`.
 - `lift_qc_table_dr200` (table background, red cube; tmux `lifttable`, started 01:06) no longer matches the real
   setup. The user will stop it, commit, and start the black-cube run.
+
+### 2026-09-29: wrist_roll calibration is off by 90° on the real arm
+- The real SO101 wrist_roll reading was rotated 90° relative to sim.
+- `deploy_utils/manipulator.py`: new `_wrist_roll_offset_deg = 90.0`. Commands send `sim + 90°`
+  and readings return `real - 90°`. The calibration JSON is unchanged.
+- The sign has not been checked on hardware. If the wrist is 180° off instead of aligned, set the offset to -90.
+- The offset did nothing at first. The installed LeRobot names the SO101 robot `"so_follower"` (`SO101Follower` is an
+  alias of `SOFollower`), so every `name == "so101_follower"` branch in `manipulator.py` was skipped. That includes
+  the gripper sim↔servo mapping and the gripper DEGREES norm mode. Now checked with
+  `self._is_so101 = name in ("so101_follower", "so_follower")`.
+- `deploy_utils/robot_config.py`: the camera is now `/dev/video2` (was `/dev/video0`).
+- The wrist_roll fix moved into the calibration file. The code offset is removed from `manipulator.py`.
+  `so101_follower_arm.json` wrist_roll `homing_offset` 1625 → -1447. That is +1024 ticks (90°), wrapped by 4096
+  so it stays inside the Feetech ±2047 limit. The arm now reads −90° from before, the same as the old code offset.
+  If the wrist ends up 180° off, use `601` instead (1625 − 1024, which reads +90°).
+- Read-only motor check (arm on /dev/ttyACM0): wrist_roll `Homing_Offset` = -1447, so the JSON was written to the
+  motor. Present_Position raw 1018 ≈ -90°, which is the sim start pose. The user still sees the wrong orientation,
+  so the next step is to recalibrate. During `lerobot-calibrate`, put wrist_roll in the sim **wrist_roll = 0**
+  orientation (jaws open sideways), because LeRobot sets 0° for wrist_roll at the pose held in the "middle" step.
+  Sim renders are in the session scratchpad (`compare.png`: start -90° | 0° | -180°).
+- Recalibrated with `lerobot-calibrate`. It saved to `~/.cache/.../so_follower/None.json` (no `--robot.id`), which
+  was copied to `deploy_utils/so101_follower_arm.json`. New wrist_roll `homing_offset` = -1590 (the motor matches).
+  The other joints moved by a few ticks, and the gripper range is now 1507–3015.
+- The recalibration did not fix it, so the start pose was changed instead. `envs/robot/so101.py` keyframe `start`
+  wrist_roll -π/2 → 0 (the only 90° turn inside the URDF limit [-2.74, 2.84]). Every task's `rest_qpos` uses this
+  keyframe, so the sim start pose changes for training, demos, and deploy. Policies and demos made with the old
+  start pose (e.g. the lift QC runs) no longer match it. Collect new demos and retrain for deployment.
+- The user confirmed that with the start keyframe wrist_roll = 0, the real arm's start pose is right and the policy
+  can be deployed.

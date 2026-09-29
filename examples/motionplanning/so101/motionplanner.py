@@ -39,6 +39,7 @@ class SO101GraspSolver:
     CONTINUITY_W = 0.15  # IK: penalty per rad of the largest joint move from the current config
     TILT_W = 3.0  # place IK: preference for holding the cube flat
     GRIP_SETTLE = 3  # steps to hold still after the gripper reaches its target
+    GRIP_WAIT_MAX = 8  # extra steps a pick waits for a gripper that is still closing before calling it a miss
     SERVO_ITERS = 4  # closed-loop place corrections
     APPROACH_H, LIFT_H, PLACE_APPROACH_H, RETREAT_H = 0.05, 0.06, 0.04, 0.05
     MAX_FACE_MISALIGN_DEG = 15.0  # jaw vs cube face yaw error tolerated when exact alignment is out of reach
@@ -677,6 +678,16 @@ class SO101GraspSolver:
         self.hold(1)  # flushes: the arm comes to rest only here, just before closing
         self.set_gripper(self.g_squeeze)
         grasped = bool(self.agent.is_grasping(actor)[0])
+        # A soft, heavily damped gripper (domain randomization: low stiffness, high damping) can still be
+        # closing after the settle steps (FAST settles 1 step). Wait while it is moving rather than retry.
+        for _ in range(self.GRIP_WAIT_MAX):
+            if grasped:
+                break
+            g_prev = self.qpos()[5]
+            self.hold(1)
+            grasped = bool(self.agent.is_grasping(actor)[0])
+            if abs(self.qpos()[5] - g_prev) < 2e-3:
+                break
         if not grasped:
             self.fail_reason = "pick_grasp"
         # Once held, the jaw orientation no longer matters much, so lift with

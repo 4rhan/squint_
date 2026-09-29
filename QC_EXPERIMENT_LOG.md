@@ -1065,3 +1065,225 @@ evals (every 10k steps). Does pretraining alone now stack?
     - Result: **500/500 passed**.
     - Length: mean 228, max 299 (limit 300). Some demos use nearly the whole episode.
     - 1 demo has success turning off and on again before the end (no dwell latch; training ignores this).
+
+<<<<<<< HEAD
+=======
+---
+
+## 2026-09-28 (22:45) — LiftCube QC-FQL for real-robot deployment: setup (nothing run on the box yet)
+
+Goal: a QC-FQL LiftCube policy that runs on the real SO101 through `deploy.py`.
+
+Code (uncommitted):
+- `examples/collect_new_tasks_demos.py`: `SO101LiftCube-v1` added (existing `solutions/lift_cube.py` solver: pick the
+  cube, go back to the rest pose, hold 2 steps).
+- `train_squint_qc.py`: checkpoints also store `cfg` (the full `QCConfig`), `image_size`, `env_id`, `control_mode`.
+- `qc_agent.py`: `QCDeployAgent` (same interface as `train_squint.DeployAgent`: area-downsample to the training size,
+  deterministic one-step policy, chunk played open loop, re-query after `exec_steps`, output in env units, shape
+  [1, 6]) and `config_from_checkpoint` (reads `cfg`, or infers net sizes from the weight shapes for older checkpoints).
+- `deploy.py`: `--agent_type qc` (local `--checkpoint` required) and `--qc_exec_steps`; `agent.reset()` at every
+  episode start so a new episode doesn't continue the old chunk.
+- New `examples/run_lift_qc.sh`: collect → static check → train, one job at a time. **Domain randomization on** for
+  demos, training and eval (Squint's sim2real setup: camera pose/FOV noise, 5° joint-reading noise, cube 22–28 mm,
+  friction 0.1–0.5, plus color jitter). All previous QC runs used `--no-env_domain_randomization`, which would not
+  transfer. Defaults: 200 clean `--fast` demos (seeds 3000+), 50k offline, 1.5M online, gamma 0.9 (Squint's for
+  50-step tasks), 512×4, h=5, 16 px, eval seed 100, `--no-cudagraphs` (the CUDA-graph QC update is still untested
+  on the GPU; compile stays on).
+
+Local checks (CPU):
+- Collection, 6 demos each at seeds 1000+, `--fast`: clean 6/8 attempts saved (1 too long), lengths 26–46; DR 6/8
+  (1 plan failure, 1 too long), lengths 29–46. Both files pass `verify_demos --no-replay` (6/6); DR meta
+  `domain_randomization: true`, state 12-dim, rgb 128 px.
+- `train_squint_qc.py` smoke run on the DR demos (1 CPU env, DR + jitter, 40 offline + 300 online steps, tiny nets):
+  runs end to end, writes `ckpt.pt`, `ckpt_best.pt`, `metrics.jsonl` (deleted afterwards).
+- `QCDeployAgent` on a sim env built exactly like `deploy.py` (128 px, DR off, reward none): loads the checkpoint,
+  5 playback actions == one `act()` chunk (allclose), config inferred from weights == stored config.
+- Not tested: the real robot (no hardware here) and the GPU run.
+
+### 23:05: `deploy.py` kept original; QC deployment moved to `deploy_qc.py`
+- The user wants `deploy.py` to stay Squint's original LeRobot script, so my edits to it were reverted
+  (`git checkout deploy.py`).
+- New `deploy_qc.py` runs the original `deploy.main()` unchanged and swaps two module names it looks up when it runs:
+  - `DeployAgent` → `QCDeployAgent`.
+  - `silent_reset` → the original reset plus a reset of the agent's chunk.
+- Same flags as `deploy.py`, plus `--qc_exec_steps`. It needs a local checkpoint, not wandb.
+- `QCDeployAgent`:
+  - action scale/bias are now buffers, so `agent.to(device)` moves them.
+  - `load_checkpoint()` is a no-op, because the weights are loaded when the agent is built.
+- Test without hardware: a fake LeRobot SO101 (bus, 640×480 camera) and a scripted keyboard, 2 episodes × 12 steps:
+  - policy queried at steps 0/5/10 of each episode (`--qc_exec_steps 2`: every 2 steps);
+  - a new chunk at every episode start (2 agent resets);
+  - actions [1, 6]; 223 commands reached the robot, including the reset moves.
+
+### 23:20: moved to branch `feat/deployment`
+- Branched off `feat/scripted-demos` (3020123), with all uncommitted changes carried over. This branch is for
+  deployment work (QC deploy, the real/sim overlay image, …).
+- To be committed by the user, then pulled on the box to run `bash examples/run_lift_qc.sh` in tmux.
+- `qc_agent.py` / `train_squint_qc.py` also contain the older efficiency edits (compiled / CUDA-graph update, bulk
+  batch sampling). The Lift script runs with compile on and `--no-cudagraphs`.
+
+### 23:22: first launch of `run_lift_qc.sh` on the box failed at import
+- The box repo is now at `~/arhan/squint_`, on branch `feat/deployment`.
+- Collection crashed before collecting anything: `ModuleNotFoundError: No module named 'typing_extensions'`
+  (imported by torch). This is the same `PYTHONNOUSERSITE=1` issue as on 2026-09-27: the squint env was using a
+  copy from `~/.local`.
+- Fix: `PYTHONNOUSERSITE=1 python -m pip install typing_extensions`, then an import check of the whole chain before
+  relaunching.
+
+### 23:40: Lift demos collected on `omen`; env fixed; training not started yet
+- Box `omen` (sra@192.168.0.181, repo `~/arhan/squint_`, branch `feat/deployment` @ 11a1e14): 62 GB RAM, GPU idle.
+- **Collection** (23:26–23:27, 8 workers, DR on, `--fast`, seeds 3000+): 200/200 saved from 325 attempts (62%);
+  failures 95 plan failures + 30 too long (> 50 steps). Mean length 37, max 50. `verify_demos`: 200/200 passed.
+  File: `demos/qc/SO101LiftCube-dr-fast200.h5`.
+- **Training** crashed at import: `No module named 'click'` (wandb). Installed into the squint env with
+  `PYTHONNOUSERSITE=1 python -m pip install`: click, pydantic, sentry-sdk, platformdirs, hf-xet. `pip check`:
+  no broken requirements. `import torch, wandb, train_squint_qc` OK (torch 2.6.0+cu124, CUDA available).
+- Relaunch (tmux `lifttrain`): left to the user.
+
+### 23:53: `lift_qc_dr200` progress (box `omen`, tmux `lifttrain`, started 23:32 by the user)
+- Offline phase took about 3 min. Online phase runs at ~1,000 env steps/s (1024 envs, `--no-cudagraphs`, compile on;
+  GPU 20 GB, 95 %). ETA for 1.5M online ≈ 00:05.
+- Eval (16 episodes, eval seed 100, DR on; step = offline + online):
+
+| step | success at end | success once | return |
+|---|---|---|---|
+| offline 10k | 0.12 | 0.19 | −22.3 |
+| offline 30k | 0.31 | 0.38 | −8.2 |
+| offline 50k | 0.25 | 0.31 | −8.1 |
+| online 0.10M | 0.12 | 0.19 | 0.8 |
+| online 0.20M | 0.31 | 0.38 | 9.2 |
+| online 0.30M | 0.56 | 0.62 | 15.0 |
+| online 0.40M | 0.69 | 0.69 | 18.2 |
+| online 0.50M | 0.88 | 0.88 | 22.0 |
+| online 0.60M | 0.88 | 0.88 | 23.3 |
+| online 0.70M | 0.88 | 0.88 | 20.7 |
+| online 0.80M | 0.81 | 0.81 | 22.0 |
+
+- Unlike StackCube, the offline phase alone already lifts (up to 5/16). Online RL gets to 14/16 by 0.5M, then
+  plateaus at 0.81–0.88.
+- Training rollouts (stochastic policy, DR + jitter) are lower: success at end ~0.61–0.65. Critic loss 0.04–0.13,
+  Q ≈ 4.3 (γ 0.9), BC flow loss ~0.08.
+- `ckpt_best.pt` was saved at 23:48 (the 0.88 eval).
+
+### 00:15 (2026-09-29): `lift_qc_dr200` finished; deployment-path check in sim
+- Finished at 1.5M online steps (31 min online on `omen`).
+- Evals, online 0.95M → 1.5M: 0.69, 0.75, 0.88, **0.94** (1.25M), 0.88, 0.88, 0.88. Final return 25.1.
+- Training rollouts: success at end 0.75. Critic loss 0.06–0.07, Q 5.6–5.8, BC flow loss 0.07, distill 0.002.
+- `ckpt_best.pt` = the 1.25M-step weights (eval 15/16). Copied to the laptop at `runs/lift_qc_dr200/`.
+- `deploy.py` + `deploy_utils/` are byte-identical to upstream `aalmuzairee/squint` HEAD 7086fd5; the last deploy
+  change upstream is 2a1f6e8 ("fixed --debug flag bug").
+- New `examples/check_deploy_qc.py`: builds the env the way `deploy.py` builds its sim twin (128 px, DR off),
+  runs `QCDeployAgent`, applies deploy's `clip(action * action_scale, -1, 1)`, reports per-episode success, and
+  optionally saves videos (scene + wrist).
+- Results, CPU sim, `ckpt_best.pt`, episodes at seeds 0+:
+
+| action_scale | exec_steps | steps | DR | success at end | once | first success step |
+|---|---|---|---|---|---|---|
+| 1.0 | 5 (full chunk) | 50 | off | **0.95** (19/20; the failure lifted but missed the rest pose) | 0.95 | 22 |
+| 1.0 | 5 | 50 | on | 0.80 (10 eps) | 1.00 | 28 |
+| 0.45 | 5 | 150 | off | 0.60 | 0.70 | 59 |
+| 0.15 | 5 | 350 | off | **0.10** | 0.20 | 161 |
+| 0.15 | **1** | 350 | off | **1.00** | 1.00 | 165 |
+
+- **Finding:** scaling the actions down while still playing the whole 5-action chunk open loop breaks the policy
+  (0.15 → 1/10). Each chunk was planned for full-size steps, so a scaled chunk under-moves, and the next plan starts
+  from a state the chunk didn't expect. Re-planning every step (`--qc_exec_steps 1`, i.e. execute only the first
+  action of each chunk, receding horizon) makes it robust: 10/10 at scale 0.15.
+- Deployment recommendation for the real arm: `--qc_exec_steps 1` with deploy's default `--action_scale 0.15`
+  (`--control_freq 30`). At that speed a lift takes ~165 steps (≈ 5.5 s), so `--max_episode_steps 300`.
+
+### 01:05: Lift background overlay = photo of the real table; next run `lift_qc_table_dr200`
+- The user uploaded `image.jpeg` to the box repo root: a phone photo of the white/grey table, portrait 598×1280, with
+  a date stamp bottom-left. The env stretches overlays to 128×128, so this image would be squashed ~2×.
+- Saved a centre square crop (rows 341–939, which drops the date stamp) as `envs/lift_overlay.png` (598×598).
+- `envs/lift.py`: `LiftRandomizationConfig.rgb_overlay_path` points to it. Lift only; other tasks keep
+  `black_overlay.png`. It applies with DR on and off, so `deploy.py`'s sim twin and the `--debug` overlay use it too.
+- Checked: wrist images (128 px and the 16 px policy input), DR on/off, seeds 0–2, show the table photo behind the
+  robot and cube. A 2-demo test collection (DR, fast, seed 3000) records it too.
+- `examples/collect_new_tasks_demos.py`: the meta now records `rgb_overlay` (file name).
+- `examples/run_lift_qc.sh` defaults renamed so the black-background demos are never reused:
+  `demos/qc/SO101LiftCube-table-dr-fast200.h5`, run `lift_qc_table_dr200`. All other settings are the same as
+  `lift_qc_dr200` (200 demos, 50k offline, 1.5M online, γ 0.9, 512×4, h 5, eval seed 100).
+- Note: in the 16 px image with DR off, the grey sim arm has little contrast against the light table. DR randomizes
+  the robot color during training.
+
+### 01:06: `lift_qc_table_dr200` started on `omen` (tmux `lifttable`)
+- Changed files copied to the box by scp (not committed): `envs/lift.py`, `envs/lift_overlay.png`,
+  `examples/run_lift_qc.sh`, `examples/collect_new_tasks_demos.py`, `examples/check_deploy_qc.py`. md5sums
+  identical to the laptop. The box GPU env loads the overlay (mean wrist pixel 165 vs dark with the black overlay).
+- Launched `bash examples/run_lift_qc.sh` (logs `logs/run_lift_qc_table.out`, `logs/lift_qc_table_dr200.log`).
+- Collection 01:06–01:07: 200/200 demos, mean length 37, max 50, `verify_demos` 200/200 passed. Meta:
+  `rgb_overlay: lift_overlay.png`, DR true. File: `demos/qc/SO101LiftCube-table-dr-fast200.h5` (7,412 steps).
+- Training started 01:06:55 (offline pretraining). The first run needed ~35 min in total.
+
+### 01:30: black cube for Lift; `lift_qc_table_dr200` is superseded
+- The user's real cube is black. The sim Lift cube was pure red (`colors[:, 0] = 1`; `randomize_item_color` False).
+- `envs/lift.py`: new `LiftRandomizationConfig.cube_gray_range = (0.0, 0.08)`. The cube is RGB grey, drawn per
+  episode from this range with DR (a real black cube looks dark grey under room light), and the midpoint (0.04)
+  without DR. Cans keep their colours; `randomize_item_color` still overrides.
+- Checked: base colour 0.04 (DR off) and random (DR on); wrist renders show a black cube on the table photo; a
+  4-demo test collection (DR, fast, seeds 3000+) saved 4/4 and verified.
+- Note: the extra per-episode random draw shifts the DR episode RNG, so the same seed gives different
+  randomized layouts than in earlier runs.
+- `examples/run_lift_qc.sh` defaults: `demos/qc/SO101LiftCube-table-black-dr-fast200.h5`,
+  run `lift_qc_table_black_dr200`.
+- `lift_qc_table_dr200` (table background, red cube; tmux `lifttable`, started 01:06) no longer matches the real
+  setup. The user will stop it, commit, and start the black-cube run.
+
+### 2026-09-29: wrist_roll calibration is off by 90° on the real arm
+- The real SO101 wrist_roll reading was rotated 90° relative to sim.
+- `deploy_utils/manipulator.py`: new `_wrist_roll_offset_deg = 90.0`. Commands send `sim + 90°`
+  and readings return `real - 90°`. The calibration JSON is unchanged.
+- The sign has not been checked on hardware. If the wrist is 180° off instead of aligned, set the offset to -90.
+- The offset did nothing at first. The installed LeRobot names the SO101 robot `"so_follower"` (`SO101Follower` is an
+  alias of `SOFollower`), so every `name == "so101_follower"` branch in `manipulator.py` was skipped. That includes
+  the gripper sim↔servo mapping and the gripper DEGREES norm mode. Now checked with
+  `self._is_so101 = name in ("so101_follower", "so_follower")`.
+- `deploy_utils/robot_config.py`: the camera is now `/dev/video2` (was `/dev/video0`).
+- The wrist_roll fix moved into the calibration file. The code offset is removed from `manipulator.py`.
+  `so101_follower_arm.json` wrist_roll `homing_offset` 1625 → -1447. That is +1024 ticks (90°), wrapped by 4096
+  so it stays inside the Feetech ±2047 limit. The arm now reads −90° from before, the same as the old code offset.
+  If the wrist ends up 180° off, use `601` instead (1625 − 1024, which reads +90°).
+- Read-only motor check (arm on /dev/ttyACM0): wrist_roll `Homing_Offset` = -1447, so the JSON was written to the
+  motor. Present_Position raw 1018 ≈ -90°, which is the sim start pose. The user still sees the wrong orientation,
+  so the next step is to recalibrate. During `lerobot-calibrate`, put wrist_roll in the sim **wrist_roll = 0**
+  orientation (jaws open sideways), because LeRobot sets 0° for wrist_roll at the pose held in the "middle" step.
+  Sim renders are in the session scratchpad (`compare.png`: start -90° | 0° | -180°).
+- Recalibrated with `lerobot-calibrate`. It saved to `~/.cache/.../so_follower/None.json` (no `--robot.id`), which
+  was copied to `deploy_utils/so101_follower_arm.json`. New wrist_roll `homing_offset` = -1590 (the motor matches).
+  The other joints moved by a few ticks, and the gripper range is now 1507–3015.
+- The recalibration did not fix it, so the start pose was changed instead. `envs/robot/so101.py` keyframe `start`
+  wrist_roll -π/2 → 0 (the only 90° turn inside the URDF limit [-2.74, 2.84]). Every task's `rest_qpos` uses this
+  keyframe, so the sim start pose changes for training, demos, and deploy. Policies and demos made with the old
+  start pose (e.g. the lift QC runs) no longer match it. Collect new demos and retrain for deployment.
+- The user confirmed that with the start keyframe wrist_roll = 0, the real arm's start pose is right and the policy
+  can be deployed.
+
+>>>>>>> 3106799 (added the new task of cube unstack3)
+### 2026-09-29: new task `SO101Unstack3Cube-v1` (unstack a 3-cube tower)
+- `envs/unstack3.py` (registered in `envs/__init__.py`, horizon 150). The episode starts with a tower
+  itemA (red, top) → itemB (blue) → itemC (green, base). The robot puts itemA on the table, then itemB. It reuses
+  Stack3's cubes, sizes, DR and observations.
+- Reset: the tower xy is drawn from a box centred at (0.25, 0) with half size 0.05 (r ≤ ~0.31 m, since the tower
+  is ~8 cm tall). The yaw is random, and each upper cube is twisted ±5° on the one below. The tower stays standing
+  (checked: 30 zero-action steps, A-on-B and B-on-C both still true).
+- Success: A and B rest on the table (|z − half| ≤ 5 mm) and apart from every other cube (xy ≥ √2·(h1+h2) + 5 mm).
+  itemC is on the table within 2 cm of the tower spot. A and B are static and not touched, and the robot is static.
+  Checked by teleporting A/B onto the table: success, reward 1.0.
+- Dense reward uses the same 0–18 scale as Stack3. Stage 1 is A to the table: reach 0–2; grasped 3–5, with xy away
+  from the other cubes up to 6 cm and z held above the tower top until clear, then lowered to the table; on the
+  table and held 4–7; released 7–8. Stage 1 locks in at +9 once A is on the table and released and B is still on C,
+  in hand, or on the table. Stage 2 is the same for B. Success = 18. Penalties: −6 for touching the table and
+  −2·tanh(20·base drift) for pushing itemC. Along a demo the reward rises about monotonically 1.5 → 4 → 10.4 → 13 → 18.
+- Info stage flags: `is_itemA_on_table`, `is_itemB_on_table` (added to `stage_flag_keys` in `train_squint.py`).
+- Solver `examples/motionplanning/so101/solutions/unstack3_cube.py`. For each of A and B: pick (approach/lift
+  5 cm), place at the reachable table spot nearest the tower that is ≥7 cm from the other cubes, then hold 5.
+  Registered in `collect_new_tasks_demos.py` and `collect_qc_demos.py`; added to `visualize_sim.py`.
+- Collection (laptop, CPU): without `--fast`, 18/20 succeed but all are longer than 150 steps. With `--fast`,
+  no DR: 20/20 and 20/21 succeed, mean length 120–122. With `--fast` and DR: 17/30 before the gripper fix below,
+  48/56 after it (mean ~113, 2 too long, the rest reach limits near the box edge).
+- Solver fix (`motionplanner.py`, affects every task): all DR pick misses were seeds with a soft, heavily damped
+  gripper (normalized stiffness 0.04/0.13). With FAST's 1-step settle, the jaws had not closed yet (gripper qpos
+  still 0.29 vs target 0.11, no contacts) when `is_grasping` was checked. `_pick_once` now waits up to
+  `GRIP_WAIT_MAX = 8` extra steps while the gripper is still moving. Grasps that already succeeded are unchanged.
+- Collect: `python -m examples.collect_new_tasks_demos -e SO101Unstack3Cube-v1 -n 200 --fast --domain-randomization --workers 4 -o demos/qc/SO101Unstack3Cube-v1.h5`

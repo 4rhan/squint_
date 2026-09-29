@@ -152,6 +152,8 @@ def collect_one(env_id, num_traj, out, start_seed=0, max_attempts=None, render_s
                     camera="wrist 128px FOV71deg + per-episode pose/FOV noise iff domain_randomization=true",
                     action_noise=float(action_noise), miss_prob=float(miss_prob),
                     reward_version=getattr(unw, "reward_version", None), fast_solver=bool(fast),
+                    rgb_overlay=os.path.basename(getattr(getattr(unw, "domain_randomization_config", None),
+                                                         "rgb_overlay_path", None) or "none"),
                     note="training controller only (normalized delta @10Hz); clean images, no jitter; "
                          "actions are the executed ones (incl. action_noise)")
         f.attrs["meta"] = json.dumps(meta)

@@ -23,10 +23,12 @@ START_SEED=${START_SEED:-3000}          # StackCube used 1000+/2000+; keeps demo
 MAX_ATTEMPTS=${MAX_ATTEMPTS:-$((N_DEMOS * 3))}  # local test: ~80% of randomized attempts saved
 NOISE=${NOISE:-0}                        # recovery demos (e.g. 0.2 / 0.3) may not fit the 50-step limit
 MISS=${MISS:-0}
-DEMOS=${DEMOS:-demos/qc/SO101LiftCube-dr-fast${N_DEMOS}.h5}
+# "table-black": envs/lift_overlay.png background + black cube. Earlier runs: lift_qc_dr200 (black background,
+# red cube), lift_qc_table_dr200 (table background, red cube).
+DEMOS=${DEMOS:-demos/qc/SO101LiftCube-table-black-dr-fast${N_DEMOS}.h5}
 
 TRAIN=${TRAIN:-1}
-EXP_NAME=${EXP_NAME:-lift_qc_dr${N_DEMOS}}
+EXP_NAME=${EXP_NAME:-lift_qc_table_black_dr${N_DEMOS}}
 OFFLINE_STEPS=${OFFLINE_STEPS:-50000}    # stack_fast500: pretraining past ~100k made offline evals worse
 ONLINE_STEPS=${ONLINE_STEPS:-1500000}    # Squint's default budget for Lift
 GAMMA=${GAMMA:-0.9}                      # Squint's value for the 50-step tasks

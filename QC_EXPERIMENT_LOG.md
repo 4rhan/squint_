@@ -1025,3 +1025,43 @@ evals (every 10k steps). Does pretraining alone now stack?
   - (a) The Q term (α = 100) pushes the one-step actor off the demo manifold offline, where the critic's errors are unchecked.
   - (b) A gap between the demos (CPU sim) and eval (GPU sim, rendering).
   - Diagnostic to separate them: evaluate the BC-flow policy alone (no Q) from the checkpoint. If BC alone grasps, it's (a); if not, it's (b) or imitation.
+
+## 2026-09-29 — Rearrange3 → Rearrange2 (2 cubes, 3 pockets)
+- **Env** (`envs/rearrange.py`):
+  - Only `NUM_OBJECTS` cubes are built. Before, Rearrange2 built 3 cubes and parked the third on the table at (0.18, −0.14).
+  - Pocket positions are now set per task by `POCKET_YS`. Rearrange2 has 3 pockets centred on the arm at y = (−0.06, 0, 0.06): P0, P1, then the buffer.
+  - Goal, success and reward are unchanged: swap A and B through the buffer, max_r = 8, 300 steps.
+  - Rearrange3 is still registered, with its old 4-pocket layout.
+- **Local check (seed 0):** 2 cubes, 3 pockets, `num_correct` 0, buffer empty.
+- **Solver problem:** `solve2` succeeds on only **1/6 seeds** with the centred layout, in clean mode.
+  - 4 of the 5 failures are `pick0b / pick_reach`: the arm can't re-pick A from the buffer at y = 0.06.
+  - The old log gives 20/20 for the old layout y = (−0.09, −0.03, 0.03).
+  - `examples/check_rearrange2_layouts.sh` compares 4 layouts, to be run on the box. It hasn't been run yet (local run stopped to spare the CPU).
+- **Other changes:**
+  - `solve()` defaults to `solve2`.
+  - Wrist-visibility stages added for Rearrange2.
+  - New `examples/run_rearrange2_qc.sh`: collects 500 recovery demos (noise 0.2, miss 0.3, `REWARD_VERSION=none`), then trains QC-FQL with the same settings as the two-task run.
+- **Task videos:** the live SAPIEN viewer looks jerky.
+  - It redraws only once per 10 Hz control step, and it freezes while the solver plans (IK).
+  - New `examples/view_task.{py,sh}` records smooth mp4s instead (`VIDEO=1`), capturing a frame every 2 physics sub-steps (50 fps, 512 px), so planning time doesn't show. Default mode is still the live viewer.
+  - Test on the box (tmux `viewtest`): seed 0 PASS, 231 steps, 1155 frames. Output: `task_videos/SO101Rearrange2-v1/`.
+- **Box:** files synced into `~/squint_`, which is on branch `exp/ablations`; the changes are uncommitted there.
+- **Rearrange2 demo videos, made the same way as the other tasks** (tmux `rearr2vid`):
+  - Collected 10 recovery demos with `collect_tp3_recovery.sh` (noise 0.2, miss 0.3, `REWARD_VERSION=none`, seeds 1000+, 8 workers), then replayed them with `demo_videos.sh`.
+  - Output: `demos/qc/SO101Rearrange2-recovery10.h5`. All 10 pass the static checks and the replay; mean length 214 steps, max 241 (limit 300).
+  - Videos: `demo_videos/SO101Rearrange2-recovery10/` (scene camera + 16×16 wrist image, with step / reward / success overlaid). All 10 are PASS.
+  - Solver success with the centred pockets and recovery noise: **16/38 attempts (42%)**.
+  - The 22 failures: 15 finished with the wrong result (`success_false`, `num_correct` 0–2), 6 `pick_reach` (3 at pick1, 3 at pick0b, the re-pick from the buffer), 1 `pick_grasp`.
+- **Collected 500 Rearrange2 recovery demos** (tmux `rearr2col`, 16:08–16:33): noise 0.2, miss 0.3, seeds 1000+, 8 workers, `REWARD_VERSION=none`.
+  - Output: `demos/qc/SO101Rearrange2-recovery500.h5` (385 MB). Log: `logs/collect_rearr2_recovery500.log`.
+  - This is the file `run_rearrange2_qc.sh` expects, so a training run will skip collection.
+  - **Success: 504/1966 attempts (26%)**, lower than the 42% measured on the 10-demo run.
+  - Main failures:
+    - 399 + 299 + 5: solver finished but `num_correct` was 1, 0 or 2 (cubes not all seated).
+    - 330: `pick0b/pick_reach`, the re-pick of A from the buffer at y = 0.06.
+    - 194: `pick1/pick_reach`.
+    - 1 IK exception (non-finite residuals), skipped by the collector.
+  - **Check:** static checks plus a full replay in the env (new `REPLAY=1` option in `collect_tp3_recovery.sh`), 8 workers.
+    - Result: **500/500 passed**.
+    - Length: mean 228, max 299 (limit 300). Some demos use nearly the whole episode.
+    - 1 demo has success turning off and on again before the end (no dwell latch; training ignores this).

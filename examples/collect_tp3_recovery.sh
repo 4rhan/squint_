@@ -28,6 +28,7 @@ OUT=${OUT:-demos/qc/SO101TrayPack3-recovery.h5}
 LOG=${LOG:-logs/collect_tp3_recovery.log}  # logs/ is git-ignored
 SKIP_COLLECT=${SKIP_COLLECT:-0}
 FAST=${FAST:-0}  # 1 = policy-like solver speed (--fast), for short step limits such as SO101StackCube-v1's 50
+REPLAY=${REPLAY:-0}  # 1 = also replay every demo in the env (on $WORKERS processes), not just the static checks
 
 # training (TRAIN=1); extra train_squint_qc.py flags can be appended with TRAIN_ARGS="..."
 TRAIN=${TRAIN:-0}
@@ -58,7 +59,8 @@ if [ "$SKIP_COLLECT" != 1 ]; then
     ) 2>&1 | tee "$LOG"
 fi
 
-python -m examples.verify_demos "$OUT" --no-replay 2>&1 | tail -5 | tee -a "$LOG"
+if [ "$REPLAY" = 1 ]; then VERIFY=(--workers "$WORKERS"); else VERIFY=(--no-replay); fi
+python -m examples.verify_demos "$OUT" "${VERIFY[@]}" 2>&1 | tail -8 | tee -a "$LOG"
 
 if [ "$TRAIN" = 1 ]; then
     echo "training $EXP_NAME on $OUT (log: logs/$EXP_NAME.log)"

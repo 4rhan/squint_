@@ -1,11 +1,12 @@
 """Task C: cyclic rearrangement with a buffer (SO-101).
 
-Three occupied target pockets + one empty buffer (3-object version), and a
-two-object swap control with a buffer.
+Occupied target pockets + one empty buffer pocket; only NUM_OBJECTS cubes and
+N_POCKETS = NUM_OBJECTS + 1 pockets are built.
 
-  - SO101Rearrange3-v1 : pockets P0,P1,P2 hold A,B,C initially; goal B,C,A; P3 buffer.
-  - SO101Rearrange2-v1 : pockets P0,P1 hold A,B initially; goal B,A; P2 buffer
-    (same pocket geometry, subset).
+  - SO101Rearrange2-v1 : 2 cubes, 3 pockets (y = -0.06, 0, 0.06). P0,P1 hold A,B
+    initially; goal B,A (swap); P2 buffer.
+  - SO101Rearrange3-v1 : 3 cubes, 4 pockets. P0,P1,P2 hold A,B,C initially;
+    goal B,C,A; P3 buffer.
 
 Objects: same-size cubes, distinct colors. Pockets: shallow printed pockets
 with floors/rim colors marking the DESTINATION object (final assignment), so
@@ -58,8 +59,9 @@ class RearrangeBase(DefaultCameraEnv):
                            "rgb+state", "rgb+segmentation+state",
                            "rgb+depth+segmentation", "rgb+depth+segmentation+state"]
     agent: Union[SO100, SO101]
-    NUM_OBJECTS = 3  # 2 for swap control
-    N_POCKETS = 4    # 3 for swap control (2 targets + buffer)
+    NUM_OBJECTS = 3
+    N_POCKETS = 4    # NUM_OBJECTS targets + 1 buffer (last)
+    POCKET_YS = (-0.09, -0.03, 0.03, 0.09)
 
     def __init__(
         self, *args, robot_uids="so101", control_mode="pd_joint_target_delta_pos",
@@ -69,8 +71,8 @@ class RearrangeBase(DefaultCameraEnv):
         # cube (33.9mm) + gripper envelope; walls lowered to 10mm (no tight insertion).
         pocket_inner: float = 0.042, pocket_wall_t: float = 0.004,
         pocket_wall_h: float = 0.010, pocket_floor_t: float = 0.005,
-        # Pocket centers (table frame). 4 in a row along y at x=0.30.
-        pocket_x: float = 0.30, pocket_ys=( -0.09, -0.03, 0.03, 0.09),
+        # Pocket centers (table frame), in a row along y at x=0.30; None = POCKET_YS.
+        pocket_x: float = 0.30, pocket_ys=None,
         # Tight footprint-aware tolerances.
         place_xy_tol: float = 0.003, place_z_tol: float = 0.004,
         static_vel_thresh: float = 2e-2, dwell_time: float = 1.0,
@@ -97,7 +99,8 @@ class RearrangeBase(DefaultCameraEnv):
         self.pocket_wall_h = pocket_wall_h
         self.pocket_floor_t = pocket_floor_t
         self.pocket_x = pocket_x
-        self.pocket_ys = tuple(pocket_ys)
+        self.pocket_ys = tuple(self.POCKET_YS if pocket_ys is None else pocket_ys)
+        assert len(self.pocket_ys) == self.N_POCKETS == self.NUM_OBJECTS + 1, self.pocket_ys
         self.place_xy_tol = place_xy_tol
         self.place_z_tol = place_z_tol
         self.static_vel_thresh = static_vel_thresh
@@ -124,17 +127,12 @@ class RearrangeBase(DefaultCameraEnv):
             return 10
 
     # Permutation maps: initial pocket -> object, final pocket -> object.
-    # Objects indexed 0,1,2 (A,B,C). Pockets 0..N-1, last pocket is buffer.
+    # Objects indexed 0..NUM_OBJECTS-1 (A,B,C). Pockets 0..N-1, last pocket is buffer.
     def _init_map(self):
-        if self.NUM_OBJECTS == 3:
-            return [0, 1, 2]  # pocket i holds object i initially
-        return [0, 1]
+        return [0, 1, 2]  # pocket i holds object i initially
 
     def _goal_map(self):
-        if self.NUM_OBJECTS == 3:
-            # B,C,A in pockets 0,1,2.
-            return [1, 2, 0]
-        return [1, 0]
+        return [1, 2, 0]  # B,C,A in pockets 0,1,2
 
     def _load_scene(self, options: dict):
         self.table_scene = TableSceneBuilder(self)
@@ -154,7 +152,7 @@ class RearrangeBase(DefaultCameraEnv):
         self.cube_half = common.to_tensor(half, device=self.device)
         self.cube_dims = torch.stack([self.cube_half] * 3, dim=-1)
 
-        n_obj = 3  # always build 3 cubes; variants use first NUM_OBJECTS
+        n_obj = self.NUM_OBJECTS
         self.cubes = []
         for k in range(n_obj):
             items = []
@@ -163,7 +161,7 @@ class RearrangeBase(DefaultCameraEnv):
                 mat = sapien.pysapien.physx.PhysxMaterial(static_friction=frictions[i], dynamic_friction=frictions[i], restitution=0)
                 b.add_box_collision(half_size=[half[i]] * 3, material=mat, density=densities[i])
                 b.add_box_visual(half_size=[half[i]] * 3, material=sapien.render.RenderMaterial(base_color=COLORS3[k]))
-                b.initial_pose = sapien.Pose(p=[0.2, (k - 1) * 0.06, half[i]])
+                b.initial_pose = sapien.Pose(p=[0.2, (k - (n_obj - 1) / 2) * 0.06, half[i]])
                 b.set_scene_idxs([i])
                 it = b.build(name=f"reobj{k}-{i}")
                 items.append(it)
@@ -172,10 +170,9 @@ class RearrangeBase(DefaultCameraEnv):
             self.add_to_state_dict_registry(cube)
             self.cubes.append(cube)
 
-        # Pockets: shallow square pockets. Floor/rim color marks DESTINATION.
-        # For 3-obj: dest colors [B,G? -> B,C,A] i.e. pocket0 green? Wait COLORS3: A red,B green,C blue.
-        # Goal [1,2,0] => pocket0 destination B (green), pocket1 C (blue), pocket2 A (red), buffer neutral.
-        # For 2-obj: goal [1,0] => pocket0 B (green), pocket1 A (red), buffer neutral.
+        # Pockets: shallow square pockets. Floor/rim color marks DESTINATION (A red, B green, C blue).
+        # 3-obj goal [1,2,0] => pocket0 green, pocket1 blue, pocket2 red, buffer neutral.
+        # 2-obj goal [1,0]   => pocket0 green, pocket1 red, buffer neutral.
         n_pock = self.N_POCKETS
         goal = self._goal_map()
         dest_colors = []
@@ -256,20 +253,13 @@ class RearrangeBase(DefaultCameraEnv):
             self.agent.robot.set_pose(Pose.create_from_pq(p=[0, 0, 0], q=euler2quat(0, 0, self.base_z_rot)))
             init_map = self._init_map()
             # Build b-sized poses for reset envs (GPU partial-reset compat).
-            for k in range(3):
+            half_b = self.cube_half[env_idx] if self.cube_half.shape[0] == self.num_envs else self.cube_half[:b]
+            for k in range(self.NUM_OBJECTS):
+                p_idx = init_map.index(k)
                 xyz = torch.zeros((b, 3), device=self.device)
-                half_b = self.cube_half[env_idx] if self.cube_half.shape[0] == self.num_envs else self.cube_half[:b]
-                for j in range(b):
-                    if k < len(init_map):
-                        p_idx = init_map.index(k) if k in init_map else (self.N_POCKETS - 1)
-                    else:
-                        p_idx = None
-                    if p_idx is None:
-                        xyz[j, 0] = 0.18; xyz[j, 1] = -0.14; xyz[j, 2] = float(half_b[j].item())
-                    else:
-                        xyz[j, 0] = self.pocket_x
-                        xyz[j, 1] = self.pocket_ys[p_idx]
-                        xyz[j, 2] = self.pocket_floor_t + float(half_b[j].item())
+                xyz[:, 0] = self.pocket_x
+                xyz[:, 1] = self.pocket_ys[p_idx]
+                xyz[:, 2] = self.pocket_floor_t + half_b
                 qs = randomization.random_quaternions(b, lock_x=True, lock_y=True)
                 self.cubes[k].set_pose(Pose.create_from_pq(xyz, qs))
             self._dwell_count[env_idx] = 0
@@ -295,7 +285,7 @@ class RearrangeBase(DefaultCameraEnv):
         if self.obs_mode_struct.state:
             d = dict(qvel=self.agent.robot.get_qvel(), tcp_pose=self.agent.tcp_pose.raw_pose,
                      pockets_pose=self.pockets.pose.raw_pose)
-            for k in range(3):
+            for k in range(self.NUM_OBJECTS):
                 d[f"cube{k}_pose"] = self.cubes[k].pose.raw_pose
                 d[f"tcp_to_cube{k}"] = self.cubes[k].pose.p - self.agent.tcp_pos
             if self.domain_randomization:
@@ -338,13 +328,11 @@ class RearrangeBase(DefaultCameraEnv):
         buf = self.N_POCKETS - 1
         buf_t = self._pocket_center(buf)
         buf_occupied = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
-        for k in range(3):
-            # Only consider objects in play for buffer check? All cubes: unused
-            # cube in 2-obj variant is parked far away, so it won't trigger.
+        for k in range(n):
             p = self.cubes[k].pose.p
             dxy = torch.linalg.norm(p[:, :2] - buf_t[:, :2], dim=1)
             inside = dxy <= (self.pocket_inner / 2 + 0.005)
-            # Also require z near pocket (ignore parked cube on table far away).
+            # Also require z near pocket (a cube carried above it doesn't count).
             z_near = torch.abs(p[:, 2] - (buf_t[:, 2] + self.cube_half)) <= 0.02
             buf_occupied |= (inside & z_near)
         buffer_empty = ~buf_occupied
@@ -427,13 +415,18 @@ class RearrangeBase(DefaultCameraEnv):
 class Rearrange3(RearrangeBase):
     NUM_OBJECTS = 3
     N_POCKETS = 4
+    POCKET_YS = (-0.09, -0.03, 0.03, 0.09)
 
 
 @register_env("SO101Rearrange2-v1", max_episode_steps=300)
 class Rearrange2(RearrangeBase):
+    """Two-cube swap with a buffer: 2 cubes (A red, B green), 3 pockets centred on the arm."""
     NUM_OBJECTS = 2
     N_POCKETS = 3
+    POCKET_YS = (-0.06, 0.0, 0.06)
+
     def _init_map(self):
         return [0, 1]
+
     def _goal_map(self):
         return [1, 0]

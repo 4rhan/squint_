@@ -186,7 +186,9 @@ def evaluate(args, eval_envs, get_action_fn, logger, eval_output_dir, max_episod
     stage_flag_keys = ["is_itemB_on_itemC", "is_itemA_grasped", "is_itemA_on_itemB",
                        "in_bin_ge1", "in_bin_ge2", "in_bin_ge3",
                        # Tower / Rearrange sub-goals
-                       "base_placed", "medium_supported", "small_supported", "buffer_occupied"]
+                       "base_placed", "medium_supported", "small_supported", "buffer_occupied",
+                       # Unstack3 sub-goals
+                       "is_itemA_on_table", "is_itemB_on_table"]
     stage_once = {}
     # Envs that split their dense reward into info['rew_<term>'] (e.g. TrayPack): sum each term over
     # the episode (mean over eval envs, raw units) so the eval return can be broken down by term.

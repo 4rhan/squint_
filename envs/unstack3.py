@@ -33,7 +33,8 @@ class Unstack3(Stack3):
     - cube sizes within the Stack3 ranges (with domain randomization)
 
     **Success Conditions:**
-    - itemA and itemB rest on the table (not on another cube), apart from every other cube
+    - itemA and itemB rest on the table (not on another cube), apart from every other cube, and each was
+      taken off the tower by a grasp (knocking the tower over does not count)
     - itemC is still near where the tower stood
     - itemA and itemB are static and not touched by the robot
     - robot is static
@@ -94,7 +95,11 @@ class Unstack3(Stack3):
 
             if not hasattr(self, "tower_xy"):
                 self.tower_xy = torch.zeros((self.num_envs, 2), device=self.device)
+                self.itemA_picked_clean = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+                self.itemB_picked_clean = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
             self.tower_xy[env_idx] = xy
+            self.itemA_picked_clean[env_idx] = False
+            self.itemB_picked_clean[env_idx] = False
 
             # goal sites (hidden, debugging only): where A and B were in the tower
             self.goalA_site.set_pose(Pose.create_from_pq(poses[0].p))
@@ -123,8 +128,22 @@ class Unstack3(Stack3):
         _, _, is_itemA_on_itemB = self._is_stacked(posA, hA, posB, hB)
         _, _, is_itemB_on_itemC = self._is_stacked(posB, hB, posC, hC)
 
-        is_itemA_on_table = self._on_table(posA, hA) & self._separated(posA, hA, [(posB, hB), (posC, hC)])
-        is_itemB_on_table = self._on_table(posB, hB) & self._separated(posB, hB, [(posA, hA), (posC, hC)])
+        is_itemA_grasped = self.agent.is_grasping(self.itemA)
+        is_itemB_grasped = self.agent.is_grasping(self.itemB)
+
+        # Latched per episode: a cube counts as unstacked only if it was grasped while still properly stacked
+        # (A on B on C; B on C). Without this, knocking the tower over puts A and B on the table in ~10 steps
+        # and scores full success (seen in a noisy recovery demo).
+        self.itemA_picked_clean |= is_itemA_grasped & is_itemA_on_itemB & is_itemB_on_itemC
+        self.itemB_picked_clean |= is_itemB_grasped & is_itemB_on_itemC
+        # a cube that left its place in the tower without being picked: the tower was knocked
+        tower_knocked = ((~self.itemA_picked_clean) & (~is_itemA_on_itemB)) | (
+            (~self.itemB_picked_clean) & (~is_itemB_on_itemC))
+
+        is_itemA_on_table = (self._on_table(posA, hA) & self._separated(posA, hA, [(posB, hB), (posC, hC)])
+                             & self.itemA_picked_clean)
+        is_itemB_on_table = (self._on_table(posB, hB) & self._separated(posB, hB, [(posA, hA), (posC, hC)])
+                             & self.itemB_picked_clean)
         base_drift = self._xy_dist(posC, self.tower_xy)
         is_itemC_in_place = self._on_table(posC, hC) & (base_drift <= self.BASE_DRIFT_TOL)
 
@@ -133,8 +152,6 @@ class Unstack3(Stack3):
         is_itemA_static = itemA_vel <= 2e-2
         is_itemB_static = itemB_vel <= 2e-2
 
-        is_itemA_grasped = self.agent.is_grasping(self.itemA)
-        is_itemB_grasped = self.agent.is_grasping(self.itemB)
         is_robot_static = self.agent.is_static()
 
         robot_touching_table = self.agent.is_touching(self.table_scene.table)
@@ -161,6 +178,9 @@ class Unstack3(Stack3):
             "is_itemA_on_table": is_itemA_on_table,
             "is_itemB_on_table": is_itemB_on_table,
             "is_itemC_in_place": is_itemC_in_place,
+            "itemA_picked_clean": self.itemA_picked_clean.clone(),
+            "itemB_picked_clean": self.itemB_picked_clean.clone(),
+            "tower_knocked": tower_knocked,
             "is_itemA_on_itemB": is_itemA_on_itemB,
             "is_itemB_on_itemC": is_itemB_on_itemC,
             "is_itemA_static": is_itemA_static,
@@ -239,6 +259,8 @@ class Unstack3(Stack3):
         reward -= 6 * info["robot_touching_table"].float()
         # keep the base where it is (pushing the tower around is not unstacking)
         reward -= 2 * torch.tanh(20 * info["base_drift"])
+        # a knocked tower can't be completed any more (its cubes never count as placed)
+        reward -= 3 * info["tower_knocked"].float()
 
         return reward
 

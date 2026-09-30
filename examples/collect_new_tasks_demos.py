@@ -23,13 +23,8 @@ Usage:
   # recovery demos: noisy executed actions + deliberate first-grasp misses (see SO101GraspSolver)
   python -m examples.collect_new_tasks_demos -e SO101TrayPack3-v1 -n 300 --workers 4 --reward-version 3 \
       --action-noise 0.2 --miss-prob 0.3 --start-seed 1000 -o demos/qc/SO101TrayPack3-recovery.h5
-<<<<<<< HEAD
   python -m examples.collect_new_tasks_demos -e SO101Rearrange2-v1 -n 20 --start-seed 100 -o demos/qc/rearr2.h5
   python -m examples.collect_new_tasks_demos -e SO101Unstack3Cube-v1 -n 200 --fast -o demos/qc/SO101Unstack3Cube-v1.h5
-=======
-  python -m examples.collect_new_tasks_demos -e SO101Unstack3Cube-v1 -n 200 --fast -o demos/qc/SO101Unstack3Cube-v1.h5
-  python -m examples.collect_new_tasks_demos -e SO101Rearrange3-v1 -n 20 --start-seed 100 --domain-randomization -o demos/qc/rearr3.h5
->>>>>>> 3106799 (added the new task of cube unstack3)
 """
 import argparse
 import importlib
@@ -55,10 +50,6 @@ SOLVERS = {
     "SO101Rearrange3-v1": "examples.motionplanning.so101.solutions.rearrange:solve3",
     "SO101Rearrange2-v1": "examples.motionplanning.so101.solutions.rearrange:solve2",
     "SO101StackCube-v1": "examples.motionplanning.so101.solutions.stack_cube:solve",
-<<<<<<< HEAD
-=======
-    "SO101LiftCube-v1": "examples.motionplanning.so101.solutions.lift_cube:solve",
->>>>>>> 3106799 (added the new task of cube unstack3)
     "SO101Unstack3Cube-v1": "examples.motionplanning.so101.solutions.unstack3_cube:solve",
 }
 SOLVER_MODULES = {
@@ -70,10 +61,6 @@ SOLVER_MODULES = {
     "SO101Rearrange3-v1": "examples.motionplanning.so101.solutions.rearrange",
     "SO101Rearrange2-v1": "examples.motionplanning.so101.solutions.rearrange",
     "SO101StackCube-v1": "examples.motionplanning.so101.solutions.stack_cube",
-<<<<<<< HEAD
-=======
-    "SO101LiftCube-v1": "examples.motionplanning.so101.solutions.lift_cube",
->>>>>>> 3106799 (added the new task of cube unstack3)
     "SO101Unstack3Cube-v1": "examples.motionplanning.so101.solutions.unstack3_cube",
 }
 

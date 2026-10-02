@@ -1110,3 +1110,185 @@ evals (every 10k steps). Does pretraining alone now stack?
 - **New script `examples/run_unstack3_qc.sh`:** collect 500 recovery demos → verify → train (same protocol as
   `run_two_task_qc.sh`: 250k offline, 2M online, 512×4, γ 0.99, h 5, eval seed 100). Run `unstack3_500`.
 - Also copied `examples/view_task.{py,sh}` from `feat/deployment` (live viewer / mp4s of the solver).
+
+### 2026-09-30: sim-real co-training setup, step 1 — `simreal/` (calibration + teleop)
+- Branch `feat/sim-real-cotrain`. Goal: record real SO101 teleop demos and later mix them into QC-FQL training as a
+  BC-only source (critic masked via `critic_valid = 0`, since real episodes have no dense reward). This step covers
+  only calibration and teleop.
+- New folder `simreal/`, run in the `squint` conda env with the pip LeRobot 0.4.3 that `deploy.py` uses. The local
+  `~/lerobot` checkout (0.6.1) needs Python ≥ 3.12 and isn't used. For our calls the API is the same as 0.6.1, and
+  so is `_normalize`. In 0.4.3, importing `lerobot.teleoperators` before `lerobot.robots` causes a circular import,
+  so `hw.py` imports robots first.
+- Files:
+  - `hw.py`: ports (`FOLLOWER_PORT`/`LEADER_PORT`), ids `so101_follower_arm`/`so101_leader_arm`, calibration in
+    `simreal/calibration/{follower,leader}/`, real ↔ sim conversion identical to `deploy_utils/manipulator.py`,
+    and a SAPIEN sim mirror.
+  - `calibrate.py`, `check_calibration.py` (torque off; per-joint real/sim values, range %, error to a sim keyframe,
+    leader − follower, `--sim` mirror), `teleop.py` (soft start to the leader's pose; per-second loop Hz,
+    leader-follower error, and % of 10 Hz steps above the training action limits 0.1/0.2 rad), `show_pose.py`, `README.md`.
+  - Calibration seeds: follower = `feat/deployment`'s `deploy_utils/so101_follower_arm.json` (identical to
+    `~/.cache/.../so_follower/None.json`), leader = `~/.cache/.../so_leader/Leader.json` (2026-09-13).
+- Offline checks (no robot connected):
+  - `--help` works for all scripts.
+  - sim → real → sim round-trip error ≤ 5e-16 for the zero/rest/start/extended keyframes.
+  - Our gripper % → servo-degree conversion matches LeRobot's DEGREES normalisation at min/mid/max (−66.29/0/66.29).
+  - The sim mirror opens and sets all four keyframes.
+  - The rendered sim `zero` pose (upper arm vertical, forearm forward) matches LeRobot's "middle of range" calibration pose.
+  - Sim keyframes in LeRobot units: rest = (0, −90, 90, 37.8, −180°, gripper 2.9%).
+- Not yet tested on hardware.
+- **First hardware run (2026-09-30):**
+  - `simreal.teleop` found the motors and the file disagreeing, so it recalibrated the follower, and the new
+    calibration saved: gripper homing −1133 → −1644, range [1915, 3492]; shoulder_pan [755, 3462];
+    shoulder_lift [899, 3260]; elbow [820, 3030]; wrist_flex [1132, 2787].
+  - Then `configure()` failed while turning torque back on: `Failed to write 'Lock' on id_=6 ... There is no status
+    packet!`, i.e. the gripper stopped answering.
+  - Likely cause, not confirmed: LeRobot turns torque on without resetting `Goal_Position`. After the homing
+    offset moved 511 ticks (~45°), the closed gripper (pos 1920, range min 1915) was driven toward its stale goal
+    and stalled.
+  - Fix: `hw.connect_follower()`. It sets `Goal_Position = Present_Position` with torque off, then configures, and
+    retries on bus errors. `check_calibration.py` and `teleop.py` use it. Tested with a mocked bus only.
+  - Recovery step: power-cycle the follower.
+
+### 2026-10-02: live matplotlib plots + full reward-term logging
+- **Are the `run_unstack3_qc.sh` settings the best we have?** They're the default long-task protocol (recovery
+  demos, 512×4, γ 0.99, h 5), not proven for this task. Evidence: recovery demos help a lot (TrayPack3 ≥1 cube 0.19 →
+  0.88). Long offline phases don't (StackCube offline evals got worse past ~100k steps), so 250k offline is
+  doubtful. The same protocol failed on Tower3 (never grasped) and learned grasp but not place on StackCube; Unstack3
+  is also cube-on-cube, so the first run is a baseline.
+- **`envs/unstack3.py`:** per-term reward in `info["rew_<term>"]` (raw units, terms sum to the reward): `{A,B}_reach`,
+  `{A,B}_carry`, `{A,B}_on_table_held`, `{A,B}_released`, `A_lock_in`, `success_bonus`, `table_pen`, `drift_pen`,
+  `knocked_pen`, plus `rew_total`. The reward values are unchanged: a replay of 6 demos in the committed env and the new
+  one gives identical rewards (difference 0), and the terms sum to the reward (≤1e-7). Training/eval log them as
+  `train_rew/<term>` and `eval_rew/<term>`.
+- **`train_squint_qc.py`:**
+  - New `--plot_every_sec` (default 120). It re-runs `examples/plot_metrics.py` in a background process at most that
+    often and after every eval, so `runs/<run>/plots/*.png` stay current. 0 = off.
+  - After each eval it prints one line `EVAL_REW step=… success_at_end=… return=… | <every term>=…`
+    (`grep EVAL_REW logs/<run>.log`).
+- **`examples/plot_metrics.py`:** new `summary.png` (success, return, stage flags, critic loss, actor losses, Q; offline
+  and online on one axis) and `rewards.png` (eval and train reward terms, total). Atomic PNG writes. The per-group
+  PNGs are unchanged.
+- Checked with a CPU smoke run: all PNGs written during training, all 14 terms logged for eval and train, EVAL_REW lines
+  printed, no errors.
+
+### 2026-10-02 (12:36): `unstack3_500` on the 3060 box (`sra@192.168.0.228`, tmux `unstack3`) — QC-FQL learns Unstack3
+- Launched 11:11 with `bash examples/run_unstack3_qc.sh` at commit 7e1b002 (knocked-tower fix in, but the reward-term /
+  live-plot changes were not on the box). Offline steps **200k**, 2M online, 500 recovery demos, 512×4, γ 0.99, h 5,
+  eval seed 100, 16 eval episodes.
+- Collection 11:11–11:16 on 8 workers: 500 demos, about 45% of attempts succeeded (failures: place IK, pick reach,
+  too long, success false), mean length 123. `verify_demos`: 500/500 passed.
+- Offline (0–200k): grasp A 0–0.25, A on table ≤ 0.12, one full success (1/16 at 100k), return −15 → 0.
+  Critic loss 9.6 → 0.24, BC flow loss 1.15 → 0.23, Q ≈ 88.
+- Online (logger step = 200k offline + online; 512 sps):
+
+| logger step | success at end | return | A grasped | A on table | B on table |
+|---|---|---|---|---|---|
+| 300k | 0.25 | 50.4 | 0.94 | 0.81 | 0.31 |
+| 400k | 0.56 | 70.7 | 0.88 | 0.88 | 0.75 |
+| 600k | 0.69 | 71.3 | 0.88 | 0.75 | 0.94 |
+| 700k | 0.69 | 94.8 | 0.94 | 0.94 | 0.81 |
+| **800k** | **0.88** | 94.5 | 0.88 | 0.88 | 0.94 |
+| 900k | 0.81 | 88.9 | 0.88 | 0.81 | 0.94 |
+| 1.0M | 0.50 | 53.6 | 0.69 | 0.69 | 0.69 |
+| 1.2M | 0.62 | 65.9 | 0.75 | 0.62 | 0.94 |
+| 1.5M | 0.44 | 59.9 | 0.81 | 0.62 | 0.69 |
+
+- **Best multi-stage result so far: 14/16 full unstacks at logger 800k (600k online).** `ckpt_best.pt` (12:12) is
+  that eval. It took off right away online (0.25 after only 100k online steps), unlike TrayPack3 (0.3–0.4M) or Tower3
+  (never).
+- After 900k the deterministic evals fell to 0.44–0.62, while the training rollouts (stochastic, 1024 envs) kept
+  improving: success at end 0.51 → 0.65 → 0.74, return 62 → 88, critic loss ~2.4–2.7, Q 80 → 92. So this is eval
+  noise or overfitting to the fixed eval seed, not a collapse; to confirm, re-evaluate `ckpt_best.pt` and `ckpt.pt` on
+  many seeds. Run ends at 2.2M logger steps (~12:55).
+- Metrics and plots copied to the laptop: `runs/unstack3_500/{metrics.jsonl,plots/}` (plots made with the new
+  `plot_metrics.py`; this run has no `rew_*` terms).
+
+### 2026-10-02 (12:39): `unstack3_500` stopped; restarted as `unstack3_500_qmin` with reward terms, live plots, `--q_agg min`, 64 eval episodes
+- **Stopped** with Ctrl-C at ~1.39M online steps (logger 1.59M), at the user's request. Last evals: 1.4M 0.44, 1.5M 0.44.
+  Kept: `runs/unstack3_500/ckpt_best.pt` (logger 800k, eval 0.88) and `ckpt.pt` (12:36). Plots of the stopped run
+  are in `runs/unstack3_500/plots/` on the box.
+- **What `metrics.jsonl` shows:**
+  - **Critic overestimation.** The normalized reward is ≤ 1 per step and γ = 0.99, so a true Q value is ≤ 100. But
+    `train_rl/q_max` was 105–115 for the whole online phase, and `q_mean` kept rising (68 → 92) after the training
+    return levelled off (~85 from 1.1M logger). The eval decline (0.88 → 0.44) started in the same window.
+  - **Noisy evals.** 16 episodes have a standard error of ±0.12. The training rollouts (1024 envs, stochastic) were
+    steady at success 0.71–0.74 from 1.1M, while evals swung 0.44–0.88. `ckpt_best.pt` is chosen on this noise.
+- **Changes for the restart** (everything else is the same: the 500 existing demos, 200k offline, 2M online, 512×4,
+  γ 0.99, h 5, eval seed 100):
+  - `--q_agg min`: the TD target uses the minimum over the critic ensemble instead of the mean (clipped double-Q),
+    against the overestimation above. This is the only change to learning, so the comparison with `unstack3_500` is
+    clean.
+  - `--num_eval_envs 64`: about ±0.06 instead of ±0.12, for a better `ckpt_best.pt` choice; an eval took ~10 s at 16.
+  - The new code is on the box (reward terms in `envs/unstack3.py`, live plots and `EVAL_REW` lines in
+    `train_squint_qc.py`, `plot_metrics.py`). `examples/run_unstack3_qc.sh` gained `EXTRA_TRAIN_ARGS`. The files were
+    copied with scp; md5 matches the laptop, and they are uncommitted on both.
+- Command (tmux `unstack3`, 12:41): `EXP_NAME=unstack3_500_qmin OFFLINE_STEPS=200000 EXTRA_TRAIN_ARGS="--q_agg min
+  --num_eval_envs 64" bash examples/run_unstack3_qc.sh`. Logs: `logs/unstack3_500_qmin.log`,
+  `logs/run_unstack3_500_qmin.out`. Plots: `runs/unstack3_500_qmin/plots/`.
+
+### 2026-10-02 (14:29): `unstack3_500_qmin` finished — `--q_agg min` fixes the late eval decline
+- Finished cleanly (2M online, exit 0). `ckpt_best.pt` = logger 1.1M (64-episode eval 0.89), `ckpt.pt` = final.
+  Metrics and plots copied to the laptop: `runs/unstack3_500_qmin/`.
+
+| logger step | `unstack3_500` (mean, 16 eps) | `unstack3_500_qmin` (min, 64 eps) |
+|---|---|---|
+| 300k | 0.25 | 0.27 |
+| 600k | 0.69 | 0.72 |
+| 800k | **0.88** | 0.69 |
+| 1.0M | 0.50 | 0.72 |
+| 1.1M | 0.56 | **0.89** |
+| 1.4M | 0.44 | 0.83 |
+| 1.5M | 0.44 (stopped at 1.59M) | 0.70 |
+| 2.0M | – | 0.88 |
+| 2.2M (end) | – | 0.77 |
+
+- **Mean eval success from 600k: 0.62 (n=10) → 0.78 (n=17); training-rollout success at the end: 0.74 → 0.89.** The
+  decline after ~900k is gone: `qmin` stays at 0.66–0.89 for the rest of the run. Takeoff speed is the same (0.25–0.27
+  after 100k online), so `min` didn't slow learning.
+- Q: `q_max` is now 96–112 (was 106–115), `q_mean` ends at 89 (was 92 and rising). Some overestimation is left.
+- **Remaining failure mode (from the new reward terms):** `knocked_pen` is the only large negative term, −50 to −130
+  per eval episode (−35 to −110 in training): in some episodes the arm still knocks the tower over. `table_pen` and
+  `drift_pen` are small. Successful episodes are dominated by `A_lock_in` (~950) and `B_released` (~650).
+- Recommended default for Unstack3 from now on: `--q_agg min --num_eval_envs 64`.
+
+### 2026-10-02: what changed between `unstack3_500` and `unstack3_500_qmin` (and what didn't)
+**No architecture change.** `qc_agent.py` and `qc_data.py` are untouched. Both runs use the same model: shared CNN encoder
+on the 16×16 wrist image, critic = ensemble of Q heads (`EnsembleLinear` → GELU → LayerNorm, 512 × 4), BC flow + one-step
+distilled actor (`distill-ddpg`), h = 5 action chunks, same optimizers and learning rates, same demos, same offline
+(200k) and online (2M) steps.
+
+**The only change to learning: `--q_agg min` (an existing flag), which changes one line of the critic's TD target**
+(`qc_agent.py:206`):
+```python
+nq = self.critic_target(next_feat, next_state, next_a)     # one Q estimate per ensemble member
+next_q = nq.mean(0) if cfg.q_agg == "mean" else nq.min(0).values
+target = reward + gamma**h * mask * next_q
+```
+- `mean` (run 1): the target is the average of the ensemble's estimates. Estimates that happen to be too high are fed
+  back into the critic, so Q crept above its true maximum of 100 (normalized reward ≤ 1 per step, γ = 0.99 →
+  ≤ 1/(1−0.99) = 100); `q_max` reached 115, and the policy followed these inflated values.
+- `min` (run 2): the target is the most pessimistic estimate, the standard clipped double-Q trick from TD3/SAC. It holds
+  Q down (`q_max` 96–112) and stopped the late eval decline.
+- `q_agg` is also read at `qc_agent.py:182`, but only by the `best-of-n` actor; we use `distill-ddpg`, so only the TD
+  target changed.
+
+**The other flag, `--num_eval_envs 64`, doesn't affect training.** It only runs 64 eval episodes instead of 16 (±0.06
+instead of ±0.12), so `ckpt_best.pt` is picked on a more reliable number.
+
+**In plain language:** the critic is a group of advisors that each guess "how much reward will the robot get from
+here?", and the robot learns to pick moves the advisors rate highly. Say three advisors guess 80, 90 and 110 for a move.
+- Before (`mean`): the robot trusted the average (93). One over-optimistic advisor (the 110) pulled the average up, and
+  the critic then learned from its own inflated numbers, so scores drifted higher and higher, like a rumour that grows
+  each time it's repeated. The scores reached 115, although 100 is the most possible. The robot chased moves that
+  only *looked* great, and success dropped from 88% to 44%.
+- After (`min`): the robot trusts the most cautious advisor (80). One over-optimistic guess can no longer inflate the
+  score, so the scores stay realistic and success held at 66–89% to the end (77% final, 89% best) instead of falling.
+
+**Other changes made today** (tooling only; no effect on the model or the reward values; all uncommitted, and copied
+by scp onto the box):
+- `envs/unstack3.py`: per-term reward logging (`info["rew_<term>"]`). The reward values are unchanged; a replay
+  matches the committed env exactly.
+- `train_squint_qc.py`: live matplotlib plots (`--plot_every_sec`, default 120 s, plus after each eval) and one
+  `EVAL_REW` line per eval in the log.
+- `examples/plot_metrics.py`: `summary.png` and `rewards.png` dashboards, atomic PNG writes.
+- `examples/run_unstack3_qc.sh`: `EXTRA_TRAIN_ARGS` passthrough for extra training flags.

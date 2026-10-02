@@ -6,6 +6,7 @@
 #
 #   bash examples/run_unstack3_qc.sh                        # from the repo root, inside tmux
 #   N_DEMOS=300 ONLINE_STEPS=3000000 bash examples/run_unstack3_qc.sh
+#   EXP_NAME=unstack3_500_qmin EXTRA_TRAIN_ARGS="--q_agg min --num_eval_envs 64" bash examples/run_unstack3_qc.sh
 #
 # Logs: logs/collect_unstack3_recovery<N>.log, logs/<exp_name>.log, logs/run_<exp_name>.out. Run: runs/<exp_name>/.
 set -uo pipefail
@@ -18,6 +19,7 @@ EVAL_SEED=${EVAL_SEED:-100}
 WORKERS=${WORKERS:-8}                  # nothing else should run during collection
 DEMOS=${DEMOS:-demos/qc/SO101Unstack3Cube-recovery${N_DEMOS}.h5}
 EXP_NAME=${EXP_NAME:-unstack3_${N_DEMOS}}
+EXTRA_TRAIN_ARGS=${EXTRA_TRAIN_ARGS:-}  # more train_squint_qc.py flags, e.g. "--q_agg min --num_eval_envs 64"
 
 cd "$(dirname "$0")/.."
 mkdir -p logs
@@ -29,7 +31,7 @@ if [ -e "$DEMOS" ]; then SKIP=1; say "demos exist, skipping collection"; else SK
 TRAIN=1 SKIP_COLLECT="$SKIP" ENV_ID=SO101Unstack3Cube-v1 REWARD_VERSION=none FAST=1 \
     N="$N_DEMOS" WORKERS="$WORKERS" START_SEED=1000 MAX_ATTEMPTS=$((N_DEMOS * 4)) OUT="$DEMOS" \
     LOG="logs/collect_unstack3_recovery$N_DEMOS.log" EXP_NAME="$EXP_NAME" OFFLINE_STEPS="$OFFLINE_STEPS" \
-    TRAIN_ARGS="--total_timesteps $ONLINE_STEPS --max_demo_trajs $N_DEMOS --eval_seed $EVAL_SEED" \
+    TRAIN_ARGS="--total_timesteps $ONLINE_STEPS --max_demo_trajs $N_DEMOS --eval_seed $EVAL_SEED $EXTRA_TRAIN_ARGS" \
     bash examples/collect_tp3_recovery.sh 2>&1 | tee "logs/run_$EXP_NAME.out"
 status=${PIPESTATUS[0]}
 say "finished with exit code $status"

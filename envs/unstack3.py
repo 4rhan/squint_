@@ -198,7 +198,8 @@ class Unstack3(Stack3):
                               robot_touching_mover, mover_vel, robot_qvel, lift_z):
         """Dense reward (range roughly [0, 8]) for taking `mover` off the tower and putting it on the table
         clear of `others` (list of (pos, half)). Same staging and scale as Stack3's _stage_place_reward:
-        reach 0-2, grasped 3-5, on table while held 4-7, released 7-8."""
+        reach 0-2, grasped 3-5, on table while held 4-7, released 7-8. Also returns the tier each env is in
+        (0 reach, 1 carry, 2 on table held, 3 released) for the per-term reward log."""
         tcp_to_mover_dist = torch.linalg.norm(tcp_pos - mover_pos, axis=1)
         reward = 2 * (1 - torch.tanh(5 * tcp_to_mover_dist))
 
@@ -223,7 +224,12 @@ class Unstack3(Stack3):
         static_robot_reward = 1 - torch.tanh(torch.linalg.norm(robot_qvel, axis=1) * 10)
         on_table_and_released = mover_on_table & (~robot_touching_mover)
         reward[on_table_and_released] = (7 + (static_mover_reward + static_robot_reward) / 2.0)[on_table_and_released]
-        return reward
+
+        tier = torch.zeros_like(reward, dtype=torch.long)
+        tier[mover_grasped] = 1
+        tier[on_table_and_held] = 2
+        tier[on_table_and_released] = 3
+        return reward, tier
 
     def compute_dense_reward(self, obs: Any, action: torch.Tensor, info: dict):
         tcp_pos = self.agent.tcp_pose.p
@@ -234,7 +240,7 @@ class Unstack3(Stack3):
         tower_top = 2 * (hA + hB + hC)
 
         # Stage 1: itemA (top) off the tower onto the table
-        stage1_reward = self._stage_unstack_reward(
+        stage1_reward, tier1 = self._stage_unstack_reward(
             tcp_pos, posA, hA, [(posB, hB), (posC, hC)], info["is_itemA_grasped"], info["is_itemA_on_table"],
             info["robot_touching_itemA"], info["itemA_vel"], robot_qvel, lift_z=tower_top + hA + 0.03,
         )
@@ -246,21 +252,41 @@ class Unstack3(Stack3):
         )
 
         # Stage 2: itemB (middle) off itemC onto the table, clear of both other cubes
-        stage2_reward = self._stage_unstack_reward(
+        stage2_reward, tier2 = self._stage_unstack_reward(
             tcp_pos, posB, hB, [(posA, hA), (posC, hC)], info["is_itemB_grasped"], info["is_itemB_on_table"],
             info["robot_touching_itemB"], info["itemB_vel"], robot_qvel, lift_z=2 * hC + hB + 0.03,
         )
 
         # Same 0-18 scale as Stack3: [0, 8] for stage 1, +9 once locked in, [0, 8] for stage 2, 18 on success.
         reward = torch.where(stage1_done, 9 + stage2_reward, stage1_reward)
-        reward[info["success"]] = 18
+        success_bonus = torch.where(info["success"], 18 - reward, torch.zeros_like(reward))
+        reward = reward + success_bonus
 
         # Penalties
-        reward -= 6 * info["robot_touching_table"].float()
+        table_pen = -6 * info["robot_touching_table"].float()
         # keep the base where it is (pushing the tower around is not unstacking)
-        reward -= 2 * torch.tanh(20 * info["base_drift"])
+        drift_pen = -2 * torch.tanh(20 * info["base_drift"])
         # a knocked tower can't be completed any more (its cubes never count as placed)
-        reward -= 3 * info["tower_knocked"].float()
+        knocked_pen = -3 * info["tower_knocked"].float()
+        reward = reward + table_pen + drift_pen + knocked_pen
+
+        # Per-term breakdown (raw units, the terms sum to the reward) as info["rew_<term>"]; training and eval
+        # sum each over the episode and log it as train_rew/<term> and eval_rew/<term>. A stage's reward is
+        # split by the tier it is in, so the log shows where in the task the reward comes from.
+        z = torch.zeros_like(reward)
+        terms = {}
+        for name, done_mask, r, tier in (("A", ~stage1_done, stage1_reward, tier1),
+                                         ("B", stage1_done, stage2_reward, tier2)):
+            for t, tname in enumerate(("reach", "carry", "on_table_held", "released")):
+                terms[f"{name}_{tname}"] = torch.where(done_mask & (tier == t), r, z)
+        terms["A_lock_in"] = torch.where(stage1_done, torch.full_like(reward, 9.0), z)
+        terms["success_bonus"] = success_bonus
+        terms["table_pen"] = table_pen
+        terms["drift_pen"] = drift_pen
+        terms["knocked_pen"] = knocked_pen
+        for k, v in terms.items():
+            info[f"rew_{k}"] = v
+        info["rew_total"] = reward
 
         return reward
 

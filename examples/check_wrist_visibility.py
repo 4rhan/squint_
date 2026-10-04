@@ -96,6 +96,25 @@ def rearr_stages(env):
     yield "final", get_wrist(env)
 
 
+def rearr2_stages(env):
+    unw = env.unwrapped
+    env.reset(seed=0)
+    yield "initial", get_wrist(env)
+    half = float(unw.cube_half[0])
+
+    def put(k, pocket):
+        p = [[unw.pocket_x, unw.pocket_ys[pocket], unw.pocket_floor_t + half]]
+        unw.cubes[k].set_pose(Pose.create_from_pq(torch.tensor(p, device=unw.device)))
+        env.step(torch.zeros((1, 6)))
+
+    put(0, 2)  # A->buffer
+    yield "a_to_buffer", get_wrist(env)
+    put(1, 0)  # B->P0
+    yield "b_placed", get_wrist(env)
+    put(0, 1)  # A->P1
+    yield "final", get_wrist(env)
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--outdir", default="validation/wrist_vis")
@@ -104,7 +123,7 @@ def main():
         "SO101Tower3Cube-v1": tower_stages,
         "SO101TrayPack3-v1": pack_stages,
         "SO101Rearrange3-v1": rearr_stages,
-        "SO101Tower2Cube-v1": None, "SO101TrayPack1-v1": None, "SO101Rearrange2-v1": None,
+        "SO101Tower2Cube-v1": None, "SO101TrayPack1-v1": None, "SO101Rearrange2-v1": rearr2_stages,
     }
     for task, fn in tasks.items():
         if fn is None:

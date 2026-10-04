@@ -1,3 +1,4 @@
+import os
 from dataclasses import asdict, dataclass
 from typing import Any, Optional, Sequence, Union
 
@@ -33,6 +34,12 @@ class LiftRandomizationConfig(DefaultRandomizationConfig):
     item_friction_range: Sequence[float] = (0.1, 0.5)
     item_density_range: Sequence[float] = (200, 200)
     randomize_item_color: bool = False
+    cube_gray_range: Sequence[float] = (0.0, 0.08)
+    """Cube colour as an RGB grey level (0 = black). Random per episode in this range with domain randomization
+    (a real black cube looks dark grey under room light), the midpoint without. Ignored if randomize_item_color."""
+    # Lift only: background photo of the real table (centre square crop of the box's image.jpeg) instead of the
+    # shared black_overlay.png; resized to the camera size in BaseRandomEnv
+    rgb_overlay_path: Optional[str] = os.path.join(os.path.dirname(__file__), "lift_overlay.png")
 
 
 class Lift(DefaultCameraEnv):
@@ -124,9 +131,14 @@ class Lift(DefaultCameraEnv):
             raise NotImplementedError(f"Unknown item_type: {self.item_type}")
 
         # some default values for item geometry
+        cfg = self.domain_randomization_config
         colors = np.zeros((self.num_envs, 3))
         colors[:, 0] = 1
-        cfg = self.domain_randomization_config
+        if self.item_type == "cube":  # black cube (was red: colors[:, 0] = 1)
+            gray = np.ones(self.num_envs) * (cfg.cube_gray_range[0] + cfg.cube_gray_range[1]) / 2
+            if self.domain_randomization:
+                gray = self._batched_episode_rng.uniform(low=cfg.cube_gray_range[0], high=cfg.cube_gray_range[1])
+            colors = np.repeat(np.asarray(gray, dtype=np.float64).reshape(-1, 1), 3, axis=1)
         frictions = np.ones(self.num_envs) * (cfg.item_friction_range[0] + cfg.item_friction_range[1]) / 2
         densities = np.ones(self.num_envs) * (cfg.item_density_range[0] + cfg.item_density_range[1]) / 2
 

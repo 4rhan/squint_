@@ -38,10 +38,12 @@ class LeRobotRealAgent(BaseRealAgent):
         self.use_cached_qpos = use_cached_qpos
         self._cached_qpos = None
         self._motor_keys: list[str] = None
+        # Newer LeRobot names the SO101 robot "so_follower" (SO101Follower is an alias of SOFollower)
+        self._is_so101 = self.real_robot.name in ("so101_follower", "so_follower")
 
         if self.real_robot.name == "so100_follower":
             self.real_robot.bus.motors["gripper"].norm_mode = MotorNormMode.DEGREES
-        elif self.real_robot.name == "so101_follower":
+        elif self._is_so101:
             self.real_robot.bus.motors["gripper"].norm_mode = MotorNormMode.DEGREES
             # Gripper mapping from measured values:
             # Sim -10° (closed) <-> Servo -63.82° (closed)
@@ -67,7 +69,7 @@ class LeRobotRealAgent(BaseRealAgent):
         # NOTE (stao): It seems the calibration from LeRobot has some offsets in some joints. We fix reading them here to match the expected behavior
         if self.real_robot.name == "so100_follower":
             qpos["elbow_flex.pos"] = qpos["elbow_flex.pos"] + 6.8
-        elif self.real_robot.name == "so101_follower":
+        elif self._is_so101:
             # Convert gripper from sim degrees to servo degrees
             sim_deg = qpos["gripper.pos"]
             qpos["gripper.pos"] = (sim_deg - self._gripper_sim_min) / self._gripper_sim_range * self._gripper_servo_range + self._gripper_servo_min
@@ -125,7 +127,7 @@ class LeRobotRealAgent(BaseRealAgent):
         # NOTE (stao): It seems the calibration from LeRobot has some offsets in some joints. We fix reading them here to match the expected behavior
         if self.real_robot.name == "so100_follower":
             qpos_deg["elbow_flex"] = qpos_deg["elbow_flex"] - 6.8
-        elif self.real_robot.name == "so101_follower":
+        elif self._is_so101:
             # Convert gripper from servo range to sim degrees
             servo_val = qpos_deg["gripper"]
             qpos_deg["gripper"] = (servo_val - self._gripper_servo_min) / self._gripper_servo_range * self._gripper_sim_range + self._gripper_sim_min

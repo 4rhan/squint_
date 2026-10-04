@@ -9,7 +9,7 @@ import os
 import random
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from typing import Optional
 
 import gymnasium as gym
@@ -42,6 +42,9 @@ class QCArgs(Args):
     num_eval_envs: int = 16
     """eval episodes per evaluation (one success = 6%; pass 64 for tighter estimates at more memory/time)"""
     eval_seed: Optional[int] = None
+    max_episode_steps: Optional[int] = None
+    """override the env's registered step limit for training and eval (e.g. 400 for SO101TrayPack3-v1, whose
+    registered 300 leaves a policy slower than the scripted solver no time for the 3rd cube); None = registered"""
     """reset the eval envs to this seed at every eval (same layouts each time); None = new random layouts per eval"""
     gamma: float = 0.9
     """discount per env step (the h-step backup uses gamma**horizon). Squint's tuned value for these
@@ -156,6 +159,8 @@ if __name__ == "__main__":
             "--reward_version is only implemented for TrayPack and Tower"
         env_kwargs["reward_version"] = eval_env_kwargs["reward_version"] = args.reward_version
 
+    if args.max_episode_steps is not None:
+        env_kwargs["max_episode_steps"] = eval_env_kwargs["max_episode_steps"] = args.max_episode_steps
     train_envs = gym.make(args.env_id, num_envs=args.num_envs, reconfiguration_freq=args.reconfiguration_freq, **env_kwargs)
     eval_envs = gym.make(args.env_id, num_envs=args.num_eval_envs, reconfiguration_freq=args.eval_reconfiguration_freq, **eval_env_kwargs)
     max_episode_steps = gym_utils.find_max_episode_steps_value(train_envs)
@@ -250,7 +255,7 @@ if __name__ == "__main__":
                    actor_layers=args.num_layers, critic_hidden_dim=args.hidden_dim, critic_layers=args.num_layers,
                    num_q=args.num_q, q_agg=args.q_agg, gamma=args.gamma, tau=args.tau, lr=args.lr,
                    bc_encoder_grad=args.bc_encoder_grad)
-    agent = QCAgent(cfg, n_obs, n_state, n_act, device)
+    agent = QCAgent(cfg, n_obs, n_state, n_act, device, compile=args.compile, cudagraphs=args.cudagraphs)
     ckpt_step = 0
     if args.checkpoint:
         ckpt = torch.load(args.checkpoint, map_location=device)
@@ -260,8 +265,7 @@ if __name__ == "__main__":
               f"online replay and optimizer state start fresh")
     executor = ChunkExecutor(agent, act_scale, act_bias, num_envs=args.num_envs)
     eval_executor = ChunkExecutor(agent, act_scale, act_bias, num_envs=args.num_eval_envs, deterministic=True)
-    if args.compile:
-        agent.update = torch.compile(agent.update)
+    # agent.update is compiled / CUDA-graph captured inside QCAgent (--compile, --cudagraphs)
     # don't compile the executors yet — the per-env masking has dynamic shapes;
     # compile with dynamic=True if you want to try it later
 
@@ -288,9 +292,28 @@ if __name__ == "__main__":
     def sample_offline(n):
         return offline.sample(n, cfg.horizon, cfg.gamma)
 
+    # The buffers don't change during an iteration's block of updates, so the batches for k updates are
+    # drawn in one call (same distribution as k separate calls, ~40 index kernels instead of 40 * k). k is
+    # capped so one block holds ~256 MB of samples.
+    per_update_bytes = args.batch_size * (2 * int(np.prod(n_obs)) + 4 * (2 * n_state + cfg.horizon * (n_act + 2) + 4))
+    max_block = max(1, (256 << 20) // per_update_bytes)
+
+    def batch_blocks(sample_fn, n):
+        """Yield n batches of batch_size, drawn max_block at a time by sample_fn(k) -> dict of [k * B, ...]."""
+        while n > 0:
+            k = min(n, max_block)
+            block = {key: v.view(k, args.batch_size, *v.shape[1:]) for key, v in sample_fn(k).items()}
+            for i in range(k):
+                yield {key: v[i] for key, v in block.items()}
+            n -= k
+
+    # everything deploy.py needs to rebuild the policy (qc_agent.QCDeployAgent)
+    ckpt_meta = dict(horizon=cfg.horizon, cfg=asdict(cfg), image_size=args.image_size, env_id=args.env_id,
+                     control_mode=train_envs.unwrapped.agent.control_mode)
+
     def save(step):
         if args.save_model:
-            torch.save(dict(agent.state_dicts(), global_step=step, horizon=cfg.horizon), model_path)
+            torch.save(dict(agent.state_dicts(), global_step=step, **ckpt_meta), model_path)
 
     best = {"score": None}
 
@@ -300,7 +323,7 @@ if __name__ == "__main__":
         score = [float(eval_d.get(k, 0.0)) for k in ("eval/success_at_end", "eval/num_correct_max_mean", "eval/return")]
         if args.save_model and (best["score"] is None or score > best["score"]):
             best["score"] = score
-            torch.save(dict(agent.state_dicts(), global_step=step, horizon=cfg.horizon, eval=score), best_path)
+            torch.save(dict(agent.state_dicts(), global_step=step, eval=score, **ckpt_meta), best_path)
 
     # ── Offline data + pretraining ─────────────────────────────────────────
     offline = None
@@ -329,10 +352,13 @@ if __name__ == "__main__":
               f"{cfg.gamma ** 50:.3f} of its value, so later stages are nearly invisible to the critic; "
               f"long tasks need --gamma 0.99")
     if args.offline_steps > 0 and not args.checkpoint:
+        batches = iter(())
         for step in tqdm.trange(args.offline_steps, desc="offline pretrain"):
             if step % args.num_updates == 0:
                 rejitter_demos()
-            info = agent.update(sample_offline(args.batch_size))
+                batches = batch_blocks(lambda k: sample_offline(k * args.batch_size),
+                                       min(args.num_updates, args.offline_steps - step))
+            info = agent.update(next(batches))
             if step % 1000 == 0:
                 logger.log({f"offline/{k}": v.item() for k, v in info.items()}, step=step)
             if args.eval_freq > 0 and step > 0 and step % (args.eval_freq // 10) == 0:
@@ -345,13 +371,17 @@ if __name__ == "__main__":
     n_off = int(round(args.batch_size * args.offline_ratio)) if offline is not None else 0
     n_on = args.batch_size - n_off
 
-    def sample_batch():
+    def sample_batches(k):
+        """k online+offline batches as one dict of [k * batch_size, ...]; each batch is n_on replay
+        samples followed by n_off demo samples."""
         parts = []
         if n_on > 0:
-            parts.append(rb.sample(n_on, cfg.horizon, cfg.gamma))
+            p = rb.sample(k * n_on, cfg.horizon, cfg.gamma)
+            parts.append({key: v.view(k, n_on, *v.shape[1:]) for key, v in p.items()})
         if n_off > 0:
-            parts.append(sample_offline(n_off))
-        return {k: torch.cat([p[k] for p in parts], 0) for k in parts[0]}
+            p = sample_offline(k * n_off)
+            parts.append({key: v.view(k, n_off, *v.shape[1:]) for key, v in p.items()})
+        return {key: torch.cat([p[key] for p in parts], 1).flatten(0, 1) for key in parts[0]}
 
     # keep logged steps monotonic across phases, and continue a resumed run's step count
     log_off = args.offline_steps if not args.checkpoint else ckpt_step
@@ -395,10 +425,10 @@ if __name__ == "__main__":
         if global_step > args.learning_starts and rb.size >= cfg.horizon:
             rejitter_demos()
             info = {}
-            for grad_step in range(args.num_updates):
+            for grad_step, batch in enumerate(batch_blocks(sample_batches, args.num_updates)):
                 # update() steps the actor only every policy_frequency-th call; keep the newest value of every
                 # key so the actor losses are not lost when the last call of the loop is critic-only
-                info.update(agent.update(sample_batch(), update_actor=grad_step % args.policy_frequency == 0))
+                info.update(agent.update(batch, update_actor=grad_step % args.policy_frequency == 0))
             d.update({f"train_rl/{k}": v for k, v in info.items()})
 
         # per-term reward breakdown (envs that put rew_<term> in info): summed over the episode,

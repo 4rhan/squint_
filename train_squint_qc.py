@@ -7,6 +7,7 @@ chunk replay + HDF5 loader in qc_data.py.
 """
 import os
 import random
+import sys
 import time
 from dataclasses import asdict, dataclass
 from typing import Optional
@@ -41,6 +42,9 @@ class QCArgs(Args):
     num_eval_envs: int = 16
     """eval episodes per evaluation (one success = 6%; pass 64 for tighter estimates at more memory/time)"""
     eval_seed: Optional[int] = None
+    max_episode_steps: Optional[int] = None
+    """override the env's registered step limit for training and eval (e.g. 400 for SO101TrayPack3-v1, whose
+    registered 300 leaves a policy slower than the scripted solver no time for the 3rd cube); None = registered"""
     """reset the eval envs to this seed at every eval (same layouts each time); None = new random layouts per eval"""
     gamma: float = 0.9
     """discount per env step (the h-step backup uses gamma**horizon). Squint's tuned value for these
@@ -83,6 +87,10 @@ class QCArgs(Args):
     place paid only for the held cube; None = env default 2). Tower: 1 = original, 2 = no dips (default 1).
     The demo file's rewards must come from the same version (examples/relabel_demo_rewards.py)."""
     """BC flow loss also trains the shared image encoder (--no-bc_encoder_grad = old critic-only encoder)"""
+
+    plot_every_sec: float = 120.0
+    """re-draw the matplotlib plots in runs/<run>/plots/ (examples/plot_metrics.py, in a background process)
+    at most this often, and after every eval; 0 = only at the end of training"""
 
     sim_backend: str = "gpu"
     """'gpu' for real runs; 'cpu' (with --num-envs 1 --num-eval-envs 1) to smoke-test the script without a GPU"""
@@ -151,6 +159,8 @@ if __name__ == "__main__":
             "--reward_version is only implemented for TrayPack and Tower"
         env_kwargs["reward_version"] = eval_env_kwargs["reward_version"] = args.reward_version
 
+    if args.max_episode_steps is not None:
+        env_kwargs["max_episode_steps"] = eval_env_kwargs["max_episode_steps"] = args.max_episode_steps
     train_envs = gym.make(args.env_id, num_envs=args.num_envs, reconfiguration_freq=args.reconfiguration_freq, **env_kwargs)
     eval_envs = gym.make(args.env_id, num_envs=args.num_eval_envs, reconfiguration_freq=args.eval_reconfiguration_freq, **eval_env_kwargs)
     max_episode_steps = gym_utils.find_max_episode_steps_value(train_envs)
@@ -198,6 +208,43 @@ if __name__ == "__main__":
         _wandb_log(d, step)
 
     logger.log = _log_with_file
+
+    # Live plots: re-run examples/plot_metrics.py on metrics.jsonl in a background process (training never
+    # waits on matplotlib). Throttled to --plot_every_sec, forced after each eval; skipped while one is running.
+    import subprocess as _sp
+    _plot_dir = os.path.join(os.path.dirname(model_path), "plots")
+    _plot = {"proc": None, "last": 0.0}
+
+    def _replot(force=False, wait=False):
+        if args.plot_every_sec <= 0 and not wait:
+            return
+        busy = _plot["proc"] is not None and _plot["proc"].poll() is None
+        if busy and not wait:
+            return
+        if busy:
+            _plot["proc"].wait()
+        if not (force or wait) and time.time() - _plot["last"] < args.plot_every_sec:
+            return
+        os.makedirs(_plot_dir, exist_ok=True)
+        _plot["last"] = time.time()
+        with open(os.path.join(_plot_dir, "plot.log"), "a") as plog:
+            _plot["proc"] = _sp.Popen([sys.executable, "-m", "examples.plot_metrics", os.path.dirname(model_path),
+                                       "--quiet"], stdout=plog, stderr=plog,
+                                      cwd=os.path.dirname(os.path.abspath(__file__)))
+        if wait:
+            _plot["proc"].wait()
+
+    def _log_and_plot(d, step):
+        _log_with_file(d, step)
+        # one grep-able line per eval with every reward term: grep EVAL_REW logs/<run>.log
+        terms = {k.split("/", 1)[1]: float(v) for k, v in d.items() if k.startswith("eval_rew/")}
+        if terms:
+            tqdm.tqdm.write(f"EVAL_REW step={int(step)} success_at_end={float(d.get('eval/success_at_end', 0)):.2f} "
+                            f"return={float(d.get('eval/return', 0)):.2f} | "
+                            + " ".join(f"{k}={v:.1f}" for k, v in sorted(terms.items())))
+        _replot(force=any(k.startswith("eval/") for k in d))
+
+    logger.log = _log_and_plot
     if args.track:
         wandb.init(project=args.wandb_project_name, entity=args.wandb_entity, config=vars(args), name=run_name,
                    group=args.wandb_group, tags=[args.wandb_group, args.agent_name, args.env_id, f"seed={args.seed}"])

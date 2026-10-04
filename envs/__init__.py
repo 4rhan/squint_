@@ -13,3 +13,4 @@ import envs.place3
 import envs.tower
 import envs.tray_pack
 import envs.rearrange
+import envs.unstack3

@@ -1885,3 +1885,62 @@ Open question for the user: real cube sizes. The sim uses Stack3's ranges (A, B 
 - Effect: policies trained with the original pose (the Lift black-cube run, the next Unstack3 run) see the joint
   state they were trained on, and the real arm sits physically where the sim arm does. With the old keyframe change
   the policy saw wrist roll 0°, a value it never saw in training.
+
+### 2026-10-04 (15:45): Unstack3 deployment run restarted on the correct code (d9ff90f)
+- Found that the box was still on 11b984e (last pull 14:40; d9ff90f was on GitHub but not fetched), so two runs
+  used the old code: tmux `unstack3_deploy` (started 15:26, demos recollected 15:26–15:31) and a second copy
+  started 15:40:30 from an SSH terminal (pts/4, not in tmux). Both used wrist roll 0 and 64 eval episodes. Both
+  stopped.
+- Pulled d9ff90f on the box. The md5 of 10 key files (so101.py, unstack3.py, stack3.py, lift_overlay.png, the run
+  script, collector, train_squint_qc.py, qc_agent.py, deploy_qc.py, manipulator.py) matches the commit. On the
+  box GPU sim: start wrist roll −90°, overlay `lift_overlay.png`, colours red / 0.04 grey / red, `NUM_EVAL_ENVS` 16.
+- Wrong-pose outputs moved aside: `demos/qc/_old_roll0_unstack3{,_b}.h5`,
+  `runs/_old_roll0_unstack3_rbr_table_dr500{,_b}`, `logs/_old_roll0/`.
+- Started `bash examples/run_unstack3_deploy.sh` in tmux `unstack3_deploy` (15:41:30, box clock); output
+  `logs/run_unstack3_deploy.out`. It collects 500 fresh DR recovery demos, then trains `unstack3_rbr_table_dr500`
+  (16 evals, seed 100).
+
+### 2026-10-04 (16:50): `unstack3_rbr_table_dr500` (correct pose) — finished; deployment candidate 0.81
+- Box `omen` (sra@192.168.0.155), d9ff90f, tmux `unstack3_deploy`. 500 fresh DR recovery demos (15:41–15:45,
+  500/500 passed, 60,486 steps), 200k offline, 2M online (~990 sps), 16 evals at seed 100.
+- Pretraining (10k–200k): success 0–0.06 (one 0.06 at 130k), top on table 0–0.06, middle 0–0.38 (160k: the
+  policy knocks the top cube off and picks the middle one; not counted as success). The same as `unstack3_500_qmin`
+  pretraining (0–0.03). BC/critic losses and Q match that run step for step.
+- Online evals (logger step):
+
+| logger | succ end | top on table | middle on table | return | `unstack3_500_qmin` (no DR) |
+|---|---|---|---|---|---|
+| 300k | 0.00 | 0.69 | 0.06 | 21.0 | 0.27 |
+| 400k | 0.25 | 0.81 | 0.44 | 49.8 | 0.53 |
+| 500k | 0.38 | 0.81 | 0.69 | 65.0 | 0.61 |
+| 600k | 0.69 | 0.88 | 0.75 | 74.8 | 0.72 |
+| 700k | 0.50 | 0.88 | 0.56 | 69.0 | 0.70 |
+| 800k | 0.44 | 0.75 | 0.62 | 50.6 | 0.69 |
+| 900k | 0.38 | 0.88 | 0.56 | 63.6 | 0.78 |
+| 1.0M | 0.62 | 0.88 | 0.75 | 78.1 | 0.72 |
+| 1.1M | 0.81 | 0.88 | 0.81 | 83.4 | 0.89 |
+| 1.2M | 0.75 | 0.88 | 0.75 | 75.4 | 0.86 |
+| 1.3M | 0.75 | 0.81 | 0.81 | 78.0 | 0.81 |
+| 1.4M | 0.75 | 0.81 | 0.81 | 81.0 | 0.83 |
+| 1.5M | 0.62 | 0.69 | 0.81 | 66.5 | 0.70 |
+| 1.6M | 0.56 | 0.62 | 0.81 | 63.1 | 0.81 |
+| 1.7M | 0.69 | 0.81 | 0.88 | 87.2 | 0.66 |
+| 1.8M | 0.81 | 0.81 | 0.88 | 87.9 | 0.81 |
+| 1.9M | 0.75 | 0.75 | 0.88 | 81.7 | 0.86 |
+| 2.0M | **0.81** | 0.81 | 0.88 | **90.1** | 0.88 |
+| 2.1M | 0.75 | 0.81 | 0.81 | 86.2 | 0.83 |
+
+- Training rollouts (1,024 envs, stochastic, DR): success at end 0.16 (506k) → 0.40 → 0.52 → 0.55 → 0.59 → 0.67 → 0.67 →
+  0.68 (1.58M); return 37.6 → 80.0. The eval dips at 700k–900k and 1.5M–1.6M were not in the training curve
+  (16 fixed layouts flipping). Critic loss 5.4–8.2; Q max rose from 87 to 97 (≤ 100, no overestimation with
+  `--q_agg min`).
+- `ckpt_best.pt` = logger 2.0M (0.81, return 90.1; ranked by success, then return). From 1.1M on, the failures are
+  almost all at the first pick (top cube); every episode that gets the top cube off completes the task.
+- Compared with the wrong-pose DR run (wrist roll 0, stopped at online 558k: 0.14 at 500k), the correct pose learns
+  much faster (0.38 at 500k, 0.69 at 600k). Compared with the no-DR best: 1–2 episodes behind at most points, with
+  the same final level (0.75–0.81 vs 0.81–0.88).
+- Videos copied to the laptop: `runs/unstack3_rbr_table_dr500/videos/eval_1.1M_success0.81.mp4`, `eval_600k_success0.69.mp4`.
+- Next: copy `ckpt_best.pt` + final `ckpt.pt`, run `check_deploy_qc` on more layouts (DR on/off, action scale 0.15,
+  exec 1) to pick the deployment checkpoint.
+- 16:42:50: finished cleanly ("done" line, no errors). One extra eval at logger 2.2M: 0.62 (top on table 0.69, middle
+  0.75, return 70.4). The final `ckpt.pt` is this 2.2M model; `ckpt_best.pt` stays the 2.0M model (0.81, return 90.1).

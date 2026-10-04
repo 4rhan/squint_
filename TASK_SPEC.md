@@ -103,11 +103,10 @@ wall height vs occlusion, rim color visibility at 16px.
 
 IDs: `SO101Rearrange3-v1` (300 = 30 s): pockets P0,P1,P2 hold A,B,C (R,G,B)
 initially, goal B,C,A (pocket→object [1,2,0]), P3 buffer (neutral);
-`SO101Rearrange2-v1` (200 = 20 s, control): P0,P1 hold A,B, goal B,A ([1,0]),
-P2 buffer. Same pocket geometry (subset for 2-obj; unused third cube parked at
-(0.18,-0.14) out of the way).
+`SO101Rearrange2-v1` (300 = 30 s): only 2 cubes (A red, B green) and 3 pockets
+at y=(-0.06, 0, 0.06); P0,P1 hold A,B, goal B,A ([1,0]), P2 buffer (neutral).
 Pockets: shallow printed, inner 0.036 m, wall 0.005×0.012 m, floor 0.005 m.
-Centres x=0.30, y=(-0.09,-0.03,0.03,0.09) (first 3 for swap). Floors/rims colored
+Centres x=0.30, y=(-0.09,-0.03,0.03,0.09) for Rearrange3. Floors/rims colored
 by DESTINATION (e.g., 3-obj P0 green (B), P1 blue (C), P2 red (A), buffer gray),
 so initial mismatches signal goal; buffer neutral. Every pocket fits every cube
 (same 22–26 mm cubes). Occupied pocket cannot be correctly seated into (would

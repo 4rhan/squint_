@@ -1,15 +1,18 @@
 """3-cube unstack (SO-101): the reverse of SO101Stack3Cube-v1.
 
-The episode starts with a 3-cube tower itemA (red, top) -> itemB (blue, middle) -> itemC (green, base).
+The episode starts with a 3-cube tower itemA (red, top) -> itemB (black, middle) -> itemC (red, base), the
+colours of the real cubes used for deployment (see Unstack3RandomizationConfig).
 The robot takes the cubes down one at a time: first itemA onto the table, then itemB onto the table, so all
 three cubes end up resting on the table side by side. itemC never moves.
 
 Task ID: SO101Unstack3Cube-v1
 
-Cubes, sizes, observations and colours are shared with Stack3 (envs/stack3.py); only the reset (tower
-instead of scattered cubes), the success check and the reward differ.
+Cubes, sizes and observations are shared with Stack3 (envs/stack3.py); the colours, the background overlay,
+the reset (tower instead of scattered cubes), the success check and the reward differ.
 """
-from typing import Any, Sequence
+import os
+from dataclasses import dataclass
+from typing import Any, Optional, Sequence
 
 import numpy as np
 import torch
@@ -19,14 +22,26 @@ import mani_skill.envs.utils.randomization as randomization
 from mani_skill.utils.registration import register_env
 from mani_skill.utils.structs.pose import Pose
 
-from .stack3 import Stack3
+from .stack3 import Stack3, Stack3RandomizationConfig
+
+
+@dataclass
+class Unstack3RandomizationConfig(Stack3RandomizationConfig):
+    """Stack3's randomization with the real deployment setup: red / black / red cubes on the real table."""
+    itemA_color: Sequence[float] = (1.0, 0.0, 0.0)    # red, top
+    itemB_color: Sequence[float] = (0.04, 0.04, 0.04)  # black, middle (a real black cube looks dark grey)
+    itemC_color: Sequence[float] = (1.0, 0.0, 0.0)    # red, base
+    item_color_jitter: float = 0.04
+    """with domain randomization: per-episode shift of each RGB channel (black -> 0-0.08 grey, like Lift)"""
+    # photo of the real table (same image as Lift); resized to the camera size in BaseRandomEnv
+    rgb_overlay_path: Optional[str] = os.path.join(os.path.dirname(__file__), "lift_overlay.png")
 
 
 class Unstack3(Stack3):
     """
     **Task Description:**
     Unstack a 3-cube tower: pick itemA (red, top) off the tower and put it on the table, then pick itemB
-    (blue, middle) off itemC (green, base) and put it on the table, leaving all three cubes side by side.
+    (black, middle) off itemC (red, base) and put it on the table, leaving all three cubes side by side.
 
     **Randomizations:**
     - the tower's xy position (inside a reachable box) and z-axis rotation
@@ -39,6 +54,8 @@ class Unstack3(Stack3):
     - itemA and itemB are static and not touched by the robot
     - robot is static
     """
+
+    RANDOMIZATION_CONFIG = Unstack3RandomizationConfig
 
     # A cube "rests on the table" when its centre is within this of its half size above the table.
     TABLE_Z_TOL = 0.005

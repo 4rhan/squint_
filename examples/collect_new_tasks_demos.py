@@ -25,6 +25,7 @@ Usage:
       --action-noise 0.2 --miss-prob 0.3 --start-seed 1000 -o demos/qc/SO101TrayPack3-recovery.h5
   python -m examples.collect_new_tasks_demos -e SO101Rearrange2-v1 -n 20 --start-seed 100 -o demos/qc/rearr2.h5
   python -m examples.collect_new_tasks_demos -e SO101Unstack3Cube-v1 -n 200 --fast -o demos/qc/SO101Unstack3Cube-v1.h5
+  python -m examples.collect_new_tasks_demos -e SO101Place3Cube-v1 -n 200 --workers 8 --max-attempts 1000 -o demos/qc/SO101Place3Cube-v1.h5
 """
 import argparse
 import importlib
@@ -50,7 +51,9 @@ SOLVERS = {
     "SO101Rearrange3-v1": "examples.motionplanning.so101.solutions.rearrange:solve3",
     "SO101Rearrange2-v1": "examples.motionplanning.so101.solutions.rearrange:solve2",
     "SO101StackCube-v1": "examples.motionplanning.so101.solutions.stack_cube:solve",
+    "SO101LiftCube-v1": "examples.motionplanning.so101.solutions.lift_cube:solve",
     "SO101Unstack3Cube-v1": "examples.motionplanning.so101.solutions.unstack3_cube:solve",
+    "SO101Place3Cube-v1": "examples.motionplanning.so101.solutions.place3_cube:solve",
 }
 SOLVER_MODULES = {
     "SO101Tower3Cube-v1": "examples.motionplanning.so101.solutions.tower3_cube",
@@ -61,7 +64,9 @@ SOLVER_MODULES = {
     "SO101Rearrange3-v1": "examples.motionplanning.so101.solutions.rearrange",
     "SO101Rearrange2-v1": "examples.motionplanning.so101.solutions.rearrange",
     "SO101StackCube-v1": "examples.motionplanning.so101.solutions.stack_cube",
+    "SO101LiftCube-v1": "examples.motionplanning.so101.solutions.lift_cube",
     "SO101Unstack3Cube-v1": "examples.motionplanning.so101.solutions.unstack3_cube",
+    "SO101Place3Cube-v1": "examples.motionplanning.so101.solutions.place3_cube",
 }
 
 
@@ -153,6 +158,8 @@ def collect_one(env_id, num_traj, out, start_seed=0, max_attempts=None, render_s
                     camera="wrist 128px FOV71deg + per-episode pose/FOV noise iff domain_randomization=true",
                     action_noise=float(action_noise), miss_prob=float(miss_prob),
                     reward_version=getattr(unw, "reward_version", None), fast_solver=bool(fast),
+                    rgb_overlay=os.path.basename(getattr(getattr(unw, "domain_randomization_config", None),
+                                                         "rgb_overlay_path", None) or "none"),
                     note="training controller only (normalized delta @10Hz); clean images, no jitter; "
                          "actions are the executed ones (incl. action_noise)")
         f.attrs["meta"] = json.dumps(meta)
@@ -181,10 +188,11 @@ def collect_one(env_id, num_traj, out, start_seed=0, max_attempts=None, render_s
                 # Categorize unsuccessful execution (placed but checks fail).
                 try:
                     info = env.unwrapped.evaluate()
-                    n = int(info.get("num_correct", -1).reshape(-1)[0]) if hasattr(info.get("num_correct", 0), "reshape") else int(info.get("num_correct", -1))
+                    key = "num_correct" if "num_correct" in info else "num_in_bin"  # Place3 counts cubes in the bin
+                    n = int(info.get(key, -1).reshape(-1)[0]) if hasattr(info.get(key, 0), "reshape") else int(info.get(key, -1))
                 except Exception:
-                    n = -1
-                fail_cats[f"success_false:num_correct={n}"] += 1
+                    key, n = "num_correct", -1
+                fail_cats[f"success_false:{key}={n}"] += 1
                 continue
             T = len(env.actions)
             if T > horizon:

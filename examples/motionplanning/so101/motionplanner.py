@@ -729,6 +729,7 @@ class SO101GraspSolver:
             q_place = self.solve_held_ik(goal + [0, 0, release_height + extra], face_axes, seed=q_place,
                                          max_tilt_deg=max_tilt)
             if q_place is None:
+                self.fail_reason = "place_ik_tilt"
                 return False
         down = self.vertical_path(q_place, self.held_frame(q_place)[0], approach_height, face_axes, held=True)
         if len(down) < 2:

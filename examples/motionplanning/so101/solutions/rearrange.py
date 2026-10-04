@@ -64,5 +64,5 @@ def solve2(env, seed=None, debug=False, vis=False):
 
 
 def solve(env, seed=None, debug=False, vis=False):
-    # Default: 3-object cycle (caller selects via env id).
-    return solve3(env, seed, debug, vis)
+    # Default: 2-object swap; the 3-object cycle is solve3 (collector selects via env id).
+    return solve2(env, seed, debug, vis)

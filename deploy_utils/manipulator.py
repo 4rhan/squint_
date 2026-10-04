@@ -31,6 +31,11 @@ class LeRobotRealAgent(BaseRealAgent):
             currently the slowest part of LeRobot for some of the supported motors.
     """
 
+    # SO101 wrist-roll mounting offset (degrees): real = sim + offset when commanding, sim = real - offset when
+    # reading. Our real arm's wrist roll sits 90 deg away from the sim's, so the sim start pose (wrist_roll -90)
+    # is real 0. 0 = original Squint behaviour; deploy_qc.py sets it (--wrist_roll_offset_deg).
+    WRIST_ROLL_OFFSET_DEG = 0.0
+
     def __init__(self, robot: Robot, use_cached_qpos: bool = True, **kwargs):
         super().__init__(**kwargs)
         self._captured_sensor_data = None
@@ -73,6 +78,7 @@ class LeRobotRealAgent(BaseRealAgent):
             # Convert gripper from sim degrees to servo degrees
             sim_deg = qpos["gripper.pos"]
             qpos["gripper.pos"] = (sim_deg - self._gripper_sim_min) / self._gripper_sim_range * self._gripper_servo_range + self._gripper_servo_min
+            qpos["wrist_roll.pos"] = qpos["wrist_roll.pos"] + self.WRIST_ROLL_OFFSET_DEG
         self.real_robot.send_action(qpos)
 
     def reset(self, qpos: Array):
@@ -131,6 +137,7 @@ class LeRobotRealAgent(BaseRealAgent):
             # Convert gripper from servo range to sim degrees
             servo_val = qpos_deg["gripper"]
             qpos_deg["gripper"] = (servo_val - self._gripper_servo_min) / self._gripper_servo_range * self._gripper_sim_range + self._gripper_sim_min
+            qpos_deg["wrist_roll"] = qpos_deg["wrist_roll"] - self.WRIST_ROLL_OFFSET_DEG
         if self._motor_keys is None:
             self._motor_keys = list(qpos_deg.keys())
         qpos_deg = common.flatten_state_dict(qpos_deg)

@@ -5,7 +5,7 @@
 # Real setup (envs/unstack3.py, Unstack3RandomizationConfig): tower red (top) / black (middle) / red (base) on a
 # photo of the real table (envs/lift_overlay.png). Learning settings are the best Unstack3 run so far,
 # unstack3_500_qmin (best eval 0.89): 500 recovery demos (noise 0.2, miss 0.3, FAST solver), 200k offline, 2M
-# online, gamma 0.99, 512x4, h=5, --q_agg min, 64 eval episodes at eval seed 100. Unlike that run, domain
+# online, gamma 0.99, 512x4, h=5, --q_agg min, eval seed 100 (16 eval episodes here; that run used 64). Unlike that run, domain
 # randomization is ON for demos, training and eval (camera pose/FOV noise, 5 deg joint-reading noise, cube
 # sizes, friction, colour jitter, colour-jittered images), as in run_lift_qc.sh.
 #
@@ -36,7 +36,7 @@ GAMMA=${GAMMA:-0.99}                     # 150-step task (gamma 0.9 hides the se
 HIDDEN_DIM=${HIDDEN_DIM:-512}
 NUM_LAYERS=${NUM_LAYERS:-4}
 EVAL_SEED=${EVAL_SEED:-100}
-NUM_EVAL_ENVS=${NUM_EVAL_ENVS:-64}
+NUM_EVAL_ENVS=${NUM_EVAL_ENVS:-16}       # eval episodes per evaluation (all from eval seed 100)
 TRAIN_ARGS=${TRAIN_ARGS:-}
 
 cd "$(dirname "$0")/.."

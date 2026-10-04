@@ -7,7 +7,10 @@ controls, recording, --debug overlay) unchanged. Only two of its pieces are swap
   and asks the policy again after --qc_exec_steps actions)
 - the real-robot reset: also clears the agent's chunk, so a new episode never finishes the old one
 
-Usage (same flags as deploy.py, plus --qc_exec_steps):
+- the real wrist roll: shifted by --wrist_roll_offset_deg (default 90) between sim and real, because our arm's
+  wrist roll is mounted 90 deg off the sim; training is unchanged
+
+Usage (same flags as deploy.py, plus --qc_exec_steps and --wrist_roll_offset_deg):
     python deploy_qc.py --checkpoint runs/lift_qc_dr200/ckpt_best.pt --env_id SO101LiftCube-v1
     python deploy_qc.py --checkpoint runs/lift_qc_dr200/ckpt_best.pt --env_id SO101LiftCube-v1 --qc_exec_steps 2
 
@@ -30,6 +33,10 @@ class QCArgs(deploy.Args):
     qc_exec_steps: Optional[int] = None
     """actions played from each chunk before asking the policy again (default: the whole chunk, as in
     training; smaller = more closed-loop)"""
+    wrist_roll_offset_deg: float = 90.0
+    """real wrist roll = sim wrist roll + this (our arm is mounted 90 deg off the sim). Training keeps the sim
+    start pose (wrist_roll -90); with 90 the real arm starts at real 0 and the policy still reads -90. 0 = no offset.
+    Check with --debug (sim/real overlay) before running a policy."""
 
 
 def main(args: QCArgs):
@@ -47,6 +54,9 @@ def main(args: QCArgs):
         for agent in agents:
             agent.reset()
         original_reset(env, seed=seed, options=options)
+
+    deploy.LeRobotRealAgent.WRIST_ROLL_OFFSET_DEG = args.wrist_roll_offset_deg
+    print(f"wrist roll offset: real = sim + {args.wrist_roll_offset_deg} deg")
 
     # deploy.main() looks both names up in its module when it runs
     deploy.DeployAgent = make_agent

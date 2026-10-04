@@ -1823,3 +1823,65 @@ Open question for the user: real cube sizes. The sim uses Stack3's ranges (A, B 
 - Checked in `~/squint_`: Unstack3 CPU smoke training on DR demos plus `check_deploy_qc` run; Lift and Unstack3 use
   `lift_overlay.png`, Stack3 keeps `black_overlay.png`. The `~/squint_deploy` worktree was removed; the
   `feat/deployment` branch is unchanged (1b82078).
+
+### 2026-10-04 (15:15): `unstack3_rbr_table_dr500` progress vs `unstack3_500_qmin`
+- Box `omen` (RTX 4090, now at sra@192.168.0.155), repo `~/arhan/squint_` on `feat/deployment` @ 11b984e (the user's
+  merge of scripted-demos), tmux `unstack3_deploy`, started ~14:41 with `bash examples/run_unstack3_deploy.sh`.
+- Collection (finished 14:46): 500/500 merged and passed the checks, 61,468 steps (mean 123). Per-worker totals:
+  ~441 saved of ~979 attempts in the 7 complete summary lines (~45%). Main failures: pick_A reach, place_A/B IK,
+  too long, success false.
+- Training at 15:15: online ~316k/2M (logger 516k), ~990 sps (2× the 3060's 519), ETA ≈ 15:50.
+- Same logger steps, 64 eval episodes at seed 100:
+
+| logger step | current succ end | prev qmin succ end | current A on table | prev | current B on table | prev | return cur / prev |
+|---|---|---|---|---|---|---|---|
+| 200k (offline end) | 0.00 | 0.00 | 0.11 | 0.08 | 0.05 | 0.09 | −4.7 / −5.3 |
+| 300k | 0.03 | 0.27 | 0.55 | 0.77 | 0.14 | 0.44 | 17.3 / 46.4 |
+| 400k | 0.17 | 0.53 | 0.61 | 0.83 | 0.33 | 0.67 | 31.5 / 65.1 |
+| 500k | 0.14 | 0.61 | 0.62 | 0.83 | 0.31 | 0.73 | 29.6 / 75.0 |
+
+- Training rollouts at logger ~506k: success 0.086 vs 0.295; critic loss 12.1 vs 3.6 (and rising); Q mean 39 vs 59;
+  BC flow loss 0.32 vs 0.25. Offline phase similar (BC 0.21 vs 0.23).
+- Reading: same shape (offline ≈ 0, online climbs from the first online eval), but about 3–4× slower so far. The
+  first cube is learned (A on table 0.6), the second lags (B on table 0.3). Differences from the previous run, any of
+  which can slow it: (1) domain randomization on (camera pose/FOV, 5° joint-reading noise, cube sizes, friction
+  0.1–0.5 vs fixed 0.3, colour jitter); (2) table photo background instead of black (lower contrast at 16 px);
+  (3) top and base cubes are both red (only position tells them apart); (4) new start pose (wrist roll 0 instead of
+  −π/2), so the camera starts in a different orientation; (5) different demos (DR, ~45% vs ~50% acceptance).
+  The critic loss being 3× higher fits the noisier observations of (1). Not separable from this run alone.
+
+### 2026-10-04 (15:30): start pose reverted for training; `unstack3_rbr_table_dr500` used the wrong one
+- The user's commit 1b82078 (feat/deployment, 2026-09-29) changed the SO101 `start` keyframe wrist roll −π/2 → 0.
+  It was meant for real-robot eval only. Merging feat/deployment into the Unstack3 deployment setup carried it into
+  training. I noted it in passing but should have asked.
+- The `start` keyframe is every task's training start pose and rest pose, so `unstack3_rbr_table_dr500` (started
+  14:41 at 11b984e) trains every episode from the rolled pose. The Lift black-cube run (box at 7a1e651 when it
+  started 2026-09-29 15:48) used the original −π/2 and is not affected.
+- `envs/robot/so101.py` reverted to the original (identical to the Squint initial commit e14e757). Uncommitted.
+- Pending (user decision): stop/restart the Unstack3 run; how the eval-only roll should be applied at deploy time.
+
+### 2026-10-04 (15:35): `unstack3_rbr_table_dr500` stopped; eval set to 16 episodes
+- Stopped at the user's request (tmux `unstack3_deploy` killed) at online ~558k. Last eval: success at end 0.31,
+  A on table 0.61, B on table 0.47. Outputs are kept in `runs/unstack3_rbr_table_dr500/` on the box; they were
+  trained from the wrong start pose (wrist roll 0), see above.
+- `examples/run_unstack3_deploy.sh`: `NUM_EVAL_ENVS` default 64 → 16 (user's choice; still eval seed 100, so the
+  same 16 layouts at every eval).
+- Next run: after the user commits the start-pose revert, recollect the demos (the old file was recorded from roll 0)
+  and train again.
+
+### 2026-10-04 (15:55): wrist roll fixed at deployment only (real = sim + 90°)
+- The user's real SO101 wrist roll is mounted 90° off the sim. The earlier fix changed the sim `start` keyframe,
+  which also changed training. Training now keeps the original keyframe (wrist roll −90°), and the offset is applied
+  only in the sim↔real joint mapping.
+- `deploy_utils/manipulator.py`: `LeRobotRealAgent.WRIST_ROLL_OFFSET_DEG` (class attribute, default 0 = original
+  Squint behaviour, so `deploy.py` and `tune_camera.py` are unchanged unless set). Commands: real wrist roll =
+  sim + offset; readings: sim = real − offset (next to the existing gripper mapping).
+- `deploy_qc.py`: `--wrist_roll_offset_deg` (default 90), set on the class before `deploy.main()` runs.
+- Fake-robot test (no hardware):
+  - offset 0: real 0° reads as sim 0°, and sim −90° is sent as −90°;
+  - offset 90: real 0° reads as sim −90°, and sim −90° is sent as 0°;
+  - full `deploy_qc` run: episode commands at real ≈ 0°, the policy state wrist roll = −89.9° (as in training),
+    and on quit the arm parks at real −90° (the rest keyframe's sim −180° + 90°).
+- Effect: policies trained with the original pose (the Lift black-cube run, the next Unstack3 run) see the joint
+  state they were trained on, and the real arm sits physically where the sim arm does. With the old keyframe change
+  the policy saw wrist roll 0°, a value it never saw in training.

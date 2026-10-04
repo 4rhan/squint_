@@ -1,234 +1,245 @@
-# Squint
+# Squint + Q-Chunking: long-horizon SO-101 manipulation
 
-<p align="center">
-<img width="24%" src="https://aalmuzairee.github.io/papers-media/squint/extras/gifs/reach_cube.gif">
-<img width="24%" src="https://aalmuzairee.github.io/papers-media/squint/extras/gifs/reach_can.gif">
-<img width="24%" src="https://aalmuzairee.github.io/papers-media/squint/extras/gifs/lift_cube.gif">
-<img width="24%" src="https://aalmuzairee.github.io/papers-media/squint/extras/gifs/lift_can.gif">
-<br>
-<img width="24%" src="https://aalmuzairee.github.io/papers-media/squint/extras/gifs/place_cube.gif">
-<img width="24%" src="https://aalmuzairee.github.io/papers-media/squint/extras/gifs/place_can.gif">
-<img width="24%" src="https://aalmuzairee.github.io/papers-media/squint/extras/gifs/stack_cube.gif">
-<img width="24%" src="https://aalmuzairee.github.io/papers-media/squint/extras/gifs/stack_can.gif">
-</p> 
+This repo extends [**Squint**](https://aalmuzairee.github.io/squint) (fast visual RL for sim-to-real on the SO-101 arm)
+to **multi-stage tasks** (stacking, unstacking, packing, rearranging several cubes), which plain RL from scratch does
+not solve. The recipe:
 
-**Fast Visual Reinforcement Learning for Sim-to-Real Robotics**
+1. **Scripted demonstrations.** A motion-planning solver performs each task in simulation and records demos in exactly
+   the observation/action format the policy trains with.
+2. **QC-FQL training.** A flow-matching policy that outputs **chunks of 5 actions** (Q-chunking) is pretrained on the
+   demos (offline), then improved with RL (online), mixing demo and online data 50/50.
+3. **Sim-to-real.** The policy sees only a 16×16 wrist-camera image and the robot's joint state, like Squint, so it
+   can be deployed on the real arm.
 
-Squint is a visual Soft Actor Critic method, that through careful image preprocessing, architectural design choices, and hyperparameter selection, is able to leverage parallel environments and experience reuse effectively, achieving faster wall-clock training time than both prior visual off-policy and on-policy methods, and *solving visual tasks in minutes*.
-
-Pytorch Implementation for [[Squint: Fast Visual Reinforcement Learning for Sim-to-Real Robotics]](https://arxiv.org/abs/2602.21203) by
-
-[Abdulaziz Almuzairee](https://aalmuzairee.github.io) and [Henrik I. Christensen](https://hichristensen.com) (UC San Diego)</br>
-
-
-[[Website]](https://aalmuzairee.github.io/squint) [[Paper]](https://arxiv.org/abs/2602.21203) 
-
-If you use this code in your research, kindly cite:
-
-```bibtex
-@article{almuzairee2026squint,
-      title={Squint: Fast Visual Reinforcement Learning for Sim-to-Real Robotics}, 
-      author={Almuzairee, Abdulaziz and Christensen, Henrik I.},
-      journal={arXiv preprint arXiv:2602.21203},
-      year={2026}
-}
+```
+envs/ (tasks)  ──►  scripted solver  ──►  demos (.h5)  ──►  train_squint_qc.py  ──►  checkpoint  ──►  real robot
+                    examples/motionplanning   verify_demos      offline → online RL
 ```
 
------
+## Results so far
 
-## 📋 Requirements
+Success = all objects placed and the robot at rest at the end of the episode, measured in eval episodes on a fixed
+seed. Full details of every run are in [`QC_EXPERIMENT_LOG.md`](QC_EXPERIMENT_LOG.md).
 
-- **GPU**: NVIDIA RTX 3080 or better (At least 10GB GPU RAM)
-- **Robot**: SO-101 robot arm and wrist camera (Our robot and wrist camera are from [WowRobo](https://shop.wowrobo.com/products/so-arm101-diy-kit-assembled-version-1))
+| Task | Best success | Run | Notes |
+|---|---|---|---|
+| `SO101Unstack3Cube-v1` | **0.89** (64 eps) | `unstack3_500_qmin` | 500 recovery demos, `--q_agg min`; holds 0.66–0.89 to the end |
+| `SO101LiftCube-v1` | 0.94 (16 eps) | `lift_qc_dr200` | with domain randomization, for real-robot deployment |
+| `SO101TrayPack1-v1` | 1.00 (16 eps) | `tp1_r3` | 1-cube tray packing |
+| `SO101TrayPack3-v1` | 0.12 (16 eps) | `tp3_rec800` | ≥1 cube placed in up to 0.94 of episodes; 3rd cube is the bottleneck |
+| `SO101StackCube-v1` | ≤ 0.06 | `stack_fast500` | learns to grasp (0.94) but not to stack |
+| `SO101Tower3Cube-v1` | 0 | `tower3_500` | never learned to grasp; cause not found |
 
-## 🛠️ Installation
+What has made the difference so far:
+- **Recovery demos** (noisy actions + deliberate missed grasps, so the demos show corrections): TrayPack3 ≥1 cube
+  went from 0.19 to 0.88.
+- **`--q_agg min`** (pessimistic critic target): stopped the critic overestimating and the late collapse on Unstack3
+  (mean eval 0.62 → 0.78).
+- Long offline pretraining does **not** help: online RL does the work. 150–200k offline steps is plenty.
 
-### Create Conda Environment
+## Installation
+
+Requirements: an NVIDIA GPU (≥ 10 GB; an RTX 3060 12 GB works), and for deployment an SO-101 arm with a wrist
+camera.
 
 ```bash
 conda env create -f environment.yaml
 conda activate squint
 ```
 
-## 🎮 Simulation Training
+## Quick start (Unstack3)
 
-### Basic Training
+Run everything from the repo root. On a remote box, run long jobs inside `tmux`.
 
-Train an agent on the LiftCube task:
-
+**1. Watch the scripted solver do the task**
 ```bash
-python train_squint.py --env_id=SO101LiftCube-v1
+ENV_ID=SO101Unstack3Cube-v1 SEEDS="0 1 2" FAST=1 bash examples/view_task.sh           # live SAPIEN viewer
+VIDEO=1 ENV_ID=SO101Unstack3Cube-v1 FAST=1 bash examples/view_task.sh                 # mp4s in task_videos/
 ```
 
-### Training with Weights & Biases Logging
-
-We use wandb [(weights and biases)](https://wandb.ai/) for logging, uploading saved models, and downloading them. 
-We recommend creating a wandb account, and then enabling `--track` flag and filling the `--wandb_entity` flag in `train_squint.py`. Or you can override with the commandline:
-
+**2. Collect demos, verify them and train, in one go**
 ```bash
-python train_squint.py \
-    --env_id=SO101LiftCube-v1 \
-    --track \
-    --wandb_entity=YOUR_WANDB_USERNAME
+EXP_NAME=unstack3_500_qmin OFFLINE_STEPS=200000 \
+EXTRA_TRAIN_ARGS="--q_agg min --num_eval_envs 64" bash examples/run_unstack3_qc.sh
 ```
+This collects 500 recovery demos (`demos/qc/SO101Unstack3Cube-recovery500.h5`, ~5 min on 8 workers, skipped if the
+file exists), checks them with `examples/verify_demos.py`, then trains (offline 200k steps, online 2M steps,
+~2 h on an RTX 3060).
 
-At the end of training, the last checkpoint saved will be uploaded to wandb. You can download the last uploaded checkpoint and continue training on it by setting the `--checkpoint=wandb` flag.
-
-### Visualize Environments
-
-You can visualize all available environments (8 environments) by running:
-
+**3. Watch training**
 ```bash
-python examples/visualize_sim.py
+tail -f logs/run_unstack3_500_qmin.out        # progress
+grep EVAL_REW logs/unstack3_500_qmin.log      # every reward term, per eval
 ```
-
-### Available Environments (SO-101 Task Set)
-
-| Environment | Description | Time to Training Convergence |
-|-------------|-------------|-------------|
-| `SO101ReachCube-v1` | Reach to a target cube position | 2 minutes |
-| `SO101ReachCan-v1` | Reach to a target can position | 2 minutes |
-| `SO101LiftCube-v1` | Pick up and lift a cube | 3 minutes |
-| `SO101LiftCan-v1` | Pick up and lift a can | 4 minutes |
-| `SO101PlaceCube-v1` | Pick up a cube and place in the bin | 5 minutes |
-| `SO101PlaceCan-v1` | Pick up a can and place in the bin | 6 minutes |
-| `SO101StackCube-v1` | Stack the smaller cube on the larger one | 6 minutes |
-| `SO101StackCan-v1` | Stack the cube on the can | 9 minutes |
-
-For all our experiments we train with `--total_timesteps=1_500_000` which takes approximately 15 minutes. You can reduce the number of total timesteps depending on the task. For example, in Reach tasks you can run with `--total_timesteps=200_000` which will take ~2 minutes. Make sure your Squint agent achieves high success rate in simulation before deploying to your real SO-101 robot arm.
-
-### Domain Randomization
-
-All environments have domain randomization implemented to help sim-to-real transfer. There are shared domain randomization parameters between all environments in [`envs/base_random_env.py`](envs/base_random_env.py#L53) and per-task domain randomization 
-parameters in each environment file in `envs/`. Feel free to tune these parameters to your real world robot setup.
-
-### Expected Results
-
-For expected results, we show the plots of training with Squint agents below:
-
-</br>
-<img width="100%" src="https://aalmuzairee.github.io/papers-media/squint/extras/imgs/per_task_results.png">
-</br>
-
-
-## 🤖 Deployment on Real SO-101 Robot
-
-### Prerequisites
-
-- SO-101 robot arm is functional 
-- Wrist camera mounted appropriately
-- Calibrated motors using [LeRobot calibration](https://huggingface.co/docs/lerobot/en/so101)
-
-### Step 0: (Optional) Print 3D Objects
-
-We provide the stl files for all 3D objects used in our tasks in `deploy_utils/blender_stls`. 
-If you have access to a 3D printer, you should be able to print them, preferably with the following PLA colors:
-
-     bin.stl : white
-     can.stl : blue
-     cube.stl: red
-     large_cube.stl: blue
-
-If you have these objects in different colors, you can alter the colors of these objects in simulation in each
-of the tasks to match the real world objects.
-
-### Step 1: Configure Your Robot
-
-Edit `deploy_utils/robot_config.py` with your hardware settings. 
-
-### Step 2: Tune Camera Alignment 
-
-Visual reinforcement learning agents are sensitive to slight visual changes. The more we reduce the difference, the better your agent will transfer. 
-We use a table with a black background. In ManiSkill3 simulation, we segment the objects of interest and replace the background with the image 
-provided in `envs/black_overlay.png`. Below, we show a visual of the Simulation Env, the Overlay Image (`black_overlay.png`), the Simulation Env with the Overlay in the background, and the Real World Input Image:
-</br></br>
-<img width="100%" src="https://aalmuzairee.github.io/papers-media/squint/extras/imgs/overlay_example.png">
-</br>
-
-If your table has a different background or color, take a photo, save it, and then edit the Randomization Config in [`envs/base_random_env.py`](envs/base_random_env.py#L59) to point to your image. Once you have your image in the background, align your real camera view with the simulation:
-
+Plots in `runs/<run>/plots/` update every 2 minutes and after each eval: `summary.png` (success, return, stage
+progress, losses, Q values) and `rewards.png` (every reward term). To plot or compare runs afterwards:
 ```bash
-python deploy_utils/tune_camera.py
+python -m examples.plot_metrics runs/unstack3_500 runs/unstack3_500_qmin --out runs/compare
 ```
-</br>
-<img width="100%" src="https://aalmuzairee.github.io/papers-media/squint/extras/imgs/tune_camera_with_box_example.png">
-</br>
 
-Adjust the trackbars such that the **gripper and base positions** (outlined in the blue square) in both the simulation and the real world are as close as possible. Once they appear to match, press `p` to print 
-the wrist camera parameters, and then copy these parameters straight to wrist camera parameters in [`envs/base_random_env.py`](envs/base_random_env.py#L497)
+**Outputs** (`runs/` and `logs/` are git-ignored): `runs/<run>/ckpt_best.pt` (best eval), `ckpt.pt` (latest),
+`metrics.jsonl` (every logged value), `plots/`, `videos/` (eval rollouts).
 
+## Doing the steps by hand
 
-### Step 3: Deploy
-
-Run your trained agent on the real robot:
-
+**Collect demos** (any task with a solver, see the task table):
 ```bash
-python deploy.py \
-    --checkpoint=path/to/ckpt.pt \
-    --env_id=SO101LiftCube-v1
+python -m examples.collect_new_tasks_demos -e SO101Unstack3Cube-v1 -n 500 --workers 8 --fast \
+    --action-noise 0.2 --miss-prob 0.3 --start-seed 1000 -o demos/qc/my_demos.h5
+python -m examples.verify_demos demos/qc/my_demos.h5            # static checks + replay
+OUT=demos/qc/my_demos.h5 bash examples/demo_videos.sh          # videos of the first 10 demos
 ```
+- `--fast`: policy-like solver speed, needed when demos would otherwise exceed the episode limit.
+- `--action-noise`, `--miss-prob`: recovery demos (recommended).
+- `--domain-randomization`: record with randomized visuals and physics (needed for real-robot policies).
 
-If you trained with wandb, your last checkpoint should have been uploaded to wandb. You can deploy it by running:
-
+**Train**
 ```bash
-python deploy.py \
-    --checkpoint=wandb \
-    --env_id=SO101LiftCube-v1 \
-    --wandb_entity=YOUR_WANDB_USERNAME
+python train_squint_qc.py --env_id SO101Unstack3Cube-v1 --demo_path demos/qc/my_demos.h5 \
+    --offline_steps 200000 --total_timesteps 2000000 --gamma 0.99 --horizon 5 \
+    --hidden_dim 512 --num_layers 4 --q_agg min --num_eval_envs 64 --eval_seed 100 \
+    --no-env_domain_randomization --exp_name my_run
 ```
+Flags that matter most:
 
-**Keyboard Controls During Deployment:**
-- `s` - Skip current episode
-- `q` - Quit evaluation
+| Flag | Recommended | Why |
+|---|---|---|
+| `--gamma` | 0.99 for tasks ≥ 150 steps | with 0.9 the later stages are invisible to the critic |
+| `--horizon` | 5 | action-chunk length |
+| `--q_agg` | `min` | pessimistic TD target; prevents Q overestimation (see the log) |
+| `--offline_steps` | 150k–200k | more pretraining didn't help on any task |
+| `--num_eval_envs` | 64 | 16 episodes are too noisy to pick the best checkpoint |
+| `--eval_seed` | 100 | same eval layouts at every eval, so evals are comparable |
+| `--hidden_dim`, `--num_layers` | 512, 4 | network size used by every long-task run |
+| `--env_domain_randomization` | off in sim experiments, on for real-robot policies | |
+| `--plot_every_sec` | 120 | live plot refresh; 0 = only at the end |
 
-### Deployment Tips
+How the agent works (losses, chunk sampling, demo file format): [`QC_README.md`](QC_README.md).
 
-- For safety, run the first run with `--no-continuous_eval`, which will query you for input before each step. If the robot moves reasonably, then you can run without it.
-- Test with `--env_id=SO101ReachCube-v1` or `--env_id=SO101ReachCan-v1` before manipulation tasks.
-- If at any time during deployment you need to stop, you can press `q` or `ctrl+c`.
-- For best performances, run the robot in a well lit room with no sunlight.
-- For better transfer from sim to real, make sure the robot motor calibration is good, and the visual alignment between sim and real is good.
+## Tasks
 
-## 📁 Project Structure
+All tasks use the SO-101 arm, a wrist camera, and the joint-delta controller at 10 Hz. "Solver" = a scripted solver
+exists, so demos can be collected.
+
+| Task ID | What the robot does | Steps | Solver | Status |
+|---|---|---|---|---|
+| `SO101ReachCube/Can-v1` | reach a target object | 50 | – | original Squint |
+| `SO101LiftCube/Can-v1` | pick up and lift | 50 | Lift (`collect_qc_demos`) | original Squint; QC 0.94 |
+| `SO101PlaceCube/Can-v1` | pick and place into a bin | 50 | – | original Squint |
+| `SO101StackCube/Can-v1` | stack the cube on the larger cube / can | 50 | StackCube | original Squint; QC doesn't stack yet |
+| `SO101Stack3Cube-v1` | build a 3-cube tower | 150 | yes (`collect_qc_demos`) | early task, superseded by Tower3 |
+| `SO101Place3Cube-v1` | put 3 cubes into a bin, in a row | 250 | yes (`collect_qc_demos`) | early task |
+| `SO101Tower2Cube/3Cube-v1` | size-ordered tower at a marked spot | 200 / 300 | yes | Tower3 didn't learn |
+| `SO101TrayPack1/2/3-v1` | put 1/2/3 cubes into assigned tray compartments | 150 / 200 / 300 | yes | TrayPack1 solved; TrayPack3 0.12 |
+| `SO101Rearrange2/3-v1` | swap cubes between pockets using a buffer pocket | 300 / 400 | yes | Rearrange3 dropped (solver 12%) |
+| `SO101Unstack3Cube-v1` | take a 3-cube tower apart, top cube first | 150 | yes | **0.89** |
+
+Task definitions: `envs/`. Specs for Tower / TrayPack / Rearrange: [`TASK_SPEC.md`](TASK_SPEC.md). Domain
+randomization parameters are shared in [`envs/base_random_env.py`](envs/base_random_env.py) and per task in each
+env file. To see the original 8 tasks: `python examples/visualize_sim.py`.
+
+## Original Squint training (no demos)
+
+The upstream SAC trainer is unchanged and still works for the 50-step tasks:
+```bash
+python train_squint.py --env_id=SO101LiftCube-v1                               # ~15 min for 1.5M steps
+python train_squint.py --env_id=SO101LiftCube-v1 --track --wandb_entity=YOUR_WANDB_USERNAME
+```
+`results/` holds the upstream Squint training curves for the 8 original tasks.
+
+## Deployment on the real SO-101
+
+> `deploy.py` on this branch runs **Squint SAC checkpoints** (`train_squint.py`). Deploying **QC-FQL checkpoints**
+> (`deploy_qc.py`, `examples/check_deploy_qc.py`) is on the `feat/deployment` branch. Use `--qc_exec_steps 1`
+> (replan every step) when scaling actions down on the real arm.
+
+**Prerequisites:** a working SO-101 arm, a mounted wrist camera, and motors calibrated with
+[LeRobot calibration](https://huggingface.co/docs/lerobot/en/so101).
+
+1. **(Optional) 3D-print the objects** in `deploy_utils/blender_stls/` (bin: white, can: blue, cube: red,
+   large cube: blue), or change the object colours in the sim tasks to match yours.
+2. **Configure the robot:** edit [`deploy_utils/robot_config.py`](deploy_utils/robot_config.py) (ports, camera).
+3. **Match the background:** in simulation, everything except the robot and objects is replaced by a background
+   image (`envs/black_overlay.png`). If your table looks different, photograph it and point `rgb_overlay_path` in
+   [`envs/base_random_env.py`](envs/base_random_env.py) at the photo.
+4. **Align the camera:** `python deploy_utils/tune_camera.py`. Move the trackbars until the gripper and base line
+   up in sim and real, press `p`, and copy the printed parameters into the wrist camera settings in
+   `envs/base_random_env.py`.
+5. **Deploy:**
+   ```bash
+   python deploy.py --checkpoint=path/to/ckpt.pt --env_id=SO101LiftCube-v1
+   python deploy.py --checkpoint=wandb --env_id=SO101LiftCube-v1 --wandb_entity=YOUR_WANDB_USERNAME
+   ```
+   Keys: `s` skips the episode, `q` quits.
+
+Tips: start with `--no-continuous_eval` (asks before each step) and with a Reach task; use a well-lit room without
+sunlight; good motor calibration and camera alignment matter most for transfer.
+
+## Project structure
 
 ```
-squint/
-├── train_squint.py          # Main training script
-├── deploy.py                # Real robot deployment
-├── utils.py                 # Training utilities
-├── environment.yaml         # Conda environment
-├── envs/                    # Custom ManiSkill environments
-│   ├── base_random_env.py   # Base env with domain randomization
-│   ├── black_overlay.png    # Background overlay for sim-to-real
-│   ├── reach.py
-│   ├── lift.py
-│   ├── place.py
-│   ├── stack.py
-│   └── robot/               # Robot URDF and meshes
-├── results/                 # Training results (CSV files per task)
+├── train_squint_qc.py        # main trainer: QC-FQL (demos → offline → online RL), live plots
+├── qc_agent.py               # QC-FQL agent: CNN encoder, flow policy, one-step actor, Q-ensemble critic
+├── qc_data.py                # action-chunk replay buffer + demo .h5 loader
+├── train_squint.py           # original Squint SAC trainer (also provides Args, Logger, evaluate)
+├── utils.py                  # env wrappers: image downsampling, colour jitter
+├── deploy.py                 # real-robot deployment (Squint SAC checkpoints)
+├── environment.yaml          # conda environment
+├── envs/                     # ManiSkill tasks (see the task table)
+│   ├── base_random_env.py    # shared cameras, domain randomization, background overlay
+│   ├── reach.py lift.py place.py stack.py                   # original Squint tasks
+│   ├── stack3.py place3.py tower.py tray_pack.py rearrange.py unstack3.py   # multi-stage tasks
+│   └── robot/                # SO-101 / SO-100 model, controllers, grasp checks
 ├── examples/
-│   └── visualize_sim.py     # Visualize all environments
-└── deploy_utils/
-    ├── robot_config.py      # Robot hardware config
-    ├── manipulator.py       # Real robot interface
-    └── tune_camera.py       # Camera alignment tool
+│   ├── motionplanning/so101/ # scripted solver (motionplanner.py, collision.py) + one solution per task
+│   ├── collect_new_tasks_demos.py   # main demo collector (parallel, recovery noise)
+│   ├── collect_qc_demos.py   # collector for Lift/Stack/Stack3/Place3/Unstack3 that also records privileged state
+│   ├── verify_demos.py       # demo checks (shapes, lengths, replay ends in success)
+│   ├── replay_qc_demos.py, demo_videos.sh   # demo videos
+│   ├── relabel_demo_rewards.py              # recompute demo rewards after a reward change
+│   ├── collect_tp3_recovery.sh              # generic collect → verify → train pipeline (used by the run scripts)
+│   ├── run_unstack3_qc.sh, run_two_task_qc.sh   # experiment scripts
+│   ├── plot_metrics.py       # matplotlib plots from runs/<run>/metrics.jsonl
+│   ├── view_task.py/.sh      # watch the solver (live or mp4)
+│   ├── check_wrist_visibility.py, visualize_sim.py, viser_eval.py   # visual checks / viewers
+├── deploy_utils/             # real-robot interface, robot config, camera tuning, 3D-print files
+├── results/                  # upstream Squint training curves
+├── validation/               # wrist-camera snapshots from the Sep 26 task validation
+└── docs/                     # upstream Squint project website
 ```
 
-## 🙏 Acknowledgments
+## Documentation
 
-This work would not have been possible without the awesome open source community below:
+| File | Contents |
+|---|---|
+| [`QC_README.md`](QC_README.md) | how the QC-FQL agent works: losses, chunk sampling, demo format |
+| [`QC_EXPERIMENT_LOG.md`](QC_EXPERIMENT_LOG.md) | every experiment: settings, results, analysis, decisions |
+| [`DEMOS.md`](DEMOS.md) | demo collection and the HDF5 format |
+| [`TASK_SPEC.md`](TASK_SPEC.md) | specification of Tower, TrayPack and Rearrange |
+| [`VALIDATION.md`](VALIDATION.md) | what was verified for those tasks (Sep 26 snapshot) |
 
-- [LeanRL](https://github.com/meta-pytorch/LeanRL)
-- [CleanRL](https://github.com/vwxyzjn/cleanrl)
-- [ManiSkill3](https://github.com/haosulab/ManiSkill)
-- [LeRobot Sim2Real ManiSkill3](https://github.com/StoneT2000/lerobot-sim2real)
-- [FastTD3](https://github.com/younggyoseo/FastTD3)
-- [FastSAC](https://github.com/amazon-far/holosoma)
-- [LeRobot](https://github.com/huggingface/lerobot)
+## Acknowledgments and citation
 
-We would also like to thank [@jackvial](https://github.com/jackvial) for setting up initial support for [SO-101 Robot Arm in ManiSkill3](https://github.com/StoneT2000/lerobot-sim2real/pull/18)
+Built on **Squint** by [Abdulaziz Almuzairee](https://aalmuzairee.github.io) and
+[Henrik I. Christensen](https://hichristensen.com) (UC San Diego) ([website](https://aalmuzairee.github.io/squint),
+[paper](https://arxiv.org/abs/2602.21203)). The QC-FQL agent is a PyTorch port of the official Q-chunking (`qc`)
+JAX implementation. Squint itself builds on [LeanRL](https://github.com/meta-pytorch/LeanRL),
+[CleanRL](https://github.com/vwxyzjn/cleanrl), [ManiSkill3](https://github.com/haosulab/ManiSkill),
+[LeRobot Sim2Real ManiSkill3](https://github.com/StoneT2000/lerobot-sim2real),
+[FastTD3](https://github.com/younggyoseo/FastTD3), [FastSAC](https://github.com/amazon-far/holosoma) and
+[LeRobot](https://github.com/huggingface/lerobot); SO-101 support in ManiSkill3 was started by
+[@jackvial](https://github.com/jackvial).
 
-## 📄 License
+If you use the Squint code, please cite:
+```bibtex
+@article{almuzairee2026squint,
+      title={Squint: Fast Visual Reinforcement Learning for Sim-to-Real Robotics},
+      author={Almuzairee, Abdulaziz and Christensen, Henrik I.},
+      journal={arXiv preprint arXiv:2602.21203},
+      year={2026}
+}
+```
 
-This project is [MIT Licensed](LICENSE). Dependencies are subject to their own licenses.
+## License
 
+[MIT](LICENSE). Dependencies are subject to their own licenses.

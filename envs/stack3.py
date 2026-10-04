@@ -34,6 +34,12 @@ class Stack3RandomizationConfig(DefaultRandomizationConfig):
     item_friction_range: Sequence[float] = (0.1, 0.5)
     item_density_range: Sequence[float] = (200, 200)
     randomize_item_color: bool = False  # Keep colors distinct (red/blue/green)
+    # Cube colours (RGB 0-1). With domain randomization each channel is shifted per episode by up to
+    # +-item_color_jitter (clipped to [0, 1]); 0 = fixed colours and no extra random draws.
+    itemA_color: Sequence[float] = (1.0, 0.0, 0.0)  # red
+    itemB_color: Sequence[float] = (0.0, 0.0, 1.0)  # blue
+    itemC_color: Sequence[float] = (0.0, 1.0, 0.0)  # green
+    item_color_jitter: float = 0.0
 
 
 class Stack3(DefaultCameraEnv):
@@ -59,6 +65,8 @@ class Stack3(DefaultCameraEnv):
     SUPPORTED_OBS_MODES = ["none", "state", "state_dict", "rgb", "rgb+segmentation", "rgb+state", "rgb+segmentation+state",
                            "rgb+depth+segmentation", "rgb+depth+segmentation+state"]
     agent: Union[SO100, SO101]
+    # subclasses (Unstack3) swap in their own config class with different defaults
+    RANDOMIZATION_CONFIG = Stack3RandomizationConfig
 
     def __init__(
         self,
@@ -66,8 +74,8 @@ class Stack3(DefaultCameraEnv):
         robot_uids="so101",
         control_mode="pd_joint_target_delta_pos",
         domain_randomization_config: Union[
-            Stack3RandomizationConfig, dict
-        ] = Stack3RandomizationConfig(),
+            Stack3RandomizationConfig, dict, None
+        ] = None,
         domain_randomization=False,
         spawn_box_pos=[0.3, 0],
         spawn_box_half_size=0.2 / 2,
@@ -85,12 +93,12 @@ class Stack3(DefaultCameraEnv):
             self.rest_qpos = SO101.keyframes["start"].qpos.tolist()
 
         # Handle domain randomization config
-        self.domain_randomization_config = Stack3RandomizationConfig()
+        self.domain_randomization_config = self.RANDOMIZATION_CONFIG()
         merged_domain_randomization_config = self.domain_randomization_config.dict()
         if isinstance(domain_randomization_config, dict):
             common.dict_merge(merged_domain_randomization_config, domain_randomization_config)
             self.domain_randomization_config = dacite.from_dict(
-                data_class=Stack3RandomizationConfig,
+                data_class=self.RANDOMIZATION_CONFIG,
                 data=merged_domain_randomization_config,
                 config=dacite.Config(strict=True),
             )
@@ -121,7 +129,8 @@ class Stack3(DefaultCameraEnv):
 
     def _build_cube_item(self, name: str, half_sizes: np.ndarray, color: np.ndarray,
                           frictions: np.ndarray, densities: np.ndarray, spawn_x: float):
-        """Builds one merged cube Actor across all parallel envs."""
+        """Builds one merged cube Actor across all parallel envs. `color`: RGBA [4] or per env [num_envs, 4]."""
+        color = np.broadcast_to(np.asarray(color, dtype=np.float64), (self.num_envs, 4))
         items = []
         for i in range(self.num_envs):
             builder = self.scene.create_actor_builder()
@@ -136,7 +145,7 @@ class Stack3(DefaultCameraEnv):
             )
             builder.add_box_visual(
                 half_size=[half_sizes[i]] * 3,
-                material=sapien.render.RenderMaterial(base_color=color),
+                material=sapien.render.RenderMaterial(base_color=color[i]),
             )
             # Offset spawn position per-item so they don't collide with each other at creation
             builder.initial_pose = sapien.Pose(p=[spawn_x, 0, half_sizes[i]])
@@ -148,6 +157,17 @@ class Stack3(DefaultCameraEnv):
         merged = Actor.merge(items, name=name)
         self.add_to_state_dict_registry(merged)
         return merged
+
+    def _item_colors(self, rgb) -> np.ndarray:
+        """Per-env RGBA [num_envs, 4] for one cube: the configured colour, jittered per episode with domain
+        randomization (item_color_jitter > 0)."""
+        cfg = self.domain_randomization_config
+        colors = np.tile(np.append(np.asarray(rgb, dtype=np.float64), 1.0), (self.num_envs, 1))
+        if self.domain_randomization and cfg.item_color_jitter > 0:
+            shift = self._batched_episode_rng.uniform(low=-cfg.item_color_jitter, high=cfg.item_color_jitter,
+                                                      size=(3,))
+            colors[:, :3] = np.clip(colors[:, :3] + np.asarray(shift).reshape(self.num_envs, 3), 0, 1)
+        return colors
 
     def _load_scene(self, options: dict):
         self.table_scene = TableSceneBuilder(self)
@@ -177,7 +197,7 @@ class Stack3(DefaultCameraEnv):
             )
         self.itemA_half_sizes = common.to_tensor(itemA_half_sizes, device=self.device)
         self.itemA_dimensions = torch.stack([self.itemA_half_sizes] * 3, dim=-1)
-        colorA = np.array([1, 0, 0, 1])  # Red
+        colorA = self._item_colors(cfg.itemA_color)  # red by default
         self.itemA = self._build_cube_item(
             "itemA", itemA_half_sizes, colorA, frictions, densities, spawn_x=0.2
         )
@@ -193,7 +213,7 @@ class Stack3(DefaultCameraEnv):
             )
         self.itemB_half_sizes = common.to_tensor(itemB_half_sizes, device=self.device)
         self.itemB_dimensions = torch.stack([self.itemB_half_sizes] * 3, dim=-1)
-        colorB = np.array([0, 0, 1, 1])  # Blue
+        colorB = self._item_colors(cfg.itemB_color)  # blue by default
         self.itemB = self._build_cube_item(
             "itemB", itemB_half_sizes, colorB, frictions, densities, spawn_x=0.0
         )
@@ -209,7 +229,7 @@ class Stack3(DefaultCameraEnv):
             )
         self.itemC_half_sizes = common.to_tensor(itemC_half_sizes, device=self.device)
         self.itemC_dimensions = torch.stack([self.itemC_half_sizes] * 3, dim=-1)
-        colorC = np.array([0, 1, 0, 1])  # Green
+        colorC = self._item_colors(cfg.itemC_color)  # green by default
         self.itemC = self._build_cube_item(
             "itemC", itemC_half_sizes, colorC, frictions, densities, spawn_x=-0.2
         )

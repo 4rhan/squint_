@@ -1,0 +1,57 @@
+% Results tables (numbers from QC_EXPERIMENT_LOG.md / runs/*/metrics.jsonl; see PAPER_CONTEXT.md).
+% Requires \usepackage{booktabs}. Single seed per row.
+
+\begin{table}[t]
+  \centering
+  \caption{Unstack3 (150 steps). Success at the end of the episode, deterministic policy, fixed evaluation seed.
+  QC-FQL uses 500 scripted recovery demonstrations, 200k offline gradient steps, then online RL.
+  Mean is over evaluations from 400k online steps on. Single seed per row.}
+  \label{tab:unstack3}
+  \small
+  \begin{tabular}{lcccccc}
+    \toprule
+    Method & Demos & Eval eps & Best & Final & Mean ($\geq$400k) & $Q_{\max}$ (true max 100) \\
+    \midrule
+    Squint (SAC, $\gamma{=}0.9$)            & --  & 64 & 0.00 & 0.00$^{\dagger}$ & 0.00 & -- \\
+    QC-FQL, mean target                      & 500 & 16 & 0.88 & 0.44$^{\ddagger}$ & 0.62 & 105--115 \\
+    QC-FQL, min target (ours)                & 500 & 64 & \textbf{0.89} & \textbf{0.77} & \textbf{0.78} & 96--112 \\
+    \bottomrule
+  \end{tabular}\\[2pt]
+  {\footnotesize $^{\dagger}$stopped at 1.0M env steps (no progress). $^{\ddagger}$stopped at 1.39M online steps.}
+\end{table}
+
+\begin{table}[t]
+  \centering
+  \caption{TrayPack3 (3 cubes, 300 steps): fraction of evaluation episodes in which at least $k$ cubes were placed,
+  and full-task success. Recovery demonstrations contain noisy execution and deliberately missed grasps that are corrected.}
+  \label{tab:traypack3}
+  \small
+  \begin{tabular}{llcccc}
+    \toprule
+    Run & Demonstrations & Eval eps & $\geq$1 cube & $\geq$2 cubes & Full success \\
+    \midrule
+    \texttt{tp3\_r2}       & 100 clean              & 64 & 0.19 (best) & 0.00 & 0.00 \\
+    \texttt{tp3\_recovery} & 300 recovery           & 16 & 0.88 (end)  & 0.38 & 0.06 (end) \\
+    \texttt{tp3\_rec800}   & 800 recovery           & 16 & 1.00 (best) & 0.44 & 1.9\% (0.7--3.4M) \\
+    \texttt{tp3\_800\_h400}& 800 recovery, 400 steps, $\gamma{=}0.995$ & 64 & 0.75 (best) & 0.22 & 1.0\% (0.7--2.0M) \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\begin{table}[t]
+  \centering
+  \caption{Summary across tasks (best evaluation, single seed).}
+  \label{tab:summary}
+  \small
+  \begin{tabular}{lccl}
+    \toprule
+    Task & Steps & Best success & Notes \\
+    \midrule
+    TrayPack1  & 150 & 1.00 (16 eps) & 100 clean demos \\
+    Unstack3   & 150 & 0.89 (64 eps) & 500 recovery demos, min target \\
+    TrayPack3  & 300 & 0.12 (16 eps) & $\geq$1 cube up to 1.00; third cube is the bottleneck \\
+    StackCube  & 50  & 0.06 (16 eps) & grasp learned (1.00), stacking not \\
+    Tower3     & 300 & 0.00          & never learned to grasp \\
+    \bottomrule
+  \end{tabular}
+\end{table}

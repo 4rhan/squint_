@@ -49,6 +49,7 @@ SOLUTIONS = {
     "SO101StackCube-v1": "stack_cube",
     "SO101Stack3Cube-v1": "stack3_cube",
     "SO101Place3Cube-v1": "place3_cube",
+    "SO101Unstack3Cube-v1": "unstack3_cube",
 }
 
 

@@ -89,6 +89,9 @@ class Args:
     """the number of parallel environments"""
     num_eval_envs: int = 16
     """the number of parallel evaluation environments"""
+    eval_seed: Optional[int] = None
+    """reset the eval envs to this seed at every eval (same layouts each time, comparable to train_squint_qc.py
+    --eval_seed); None = new random layouts per eval"""
     partial_reset: bool = False
     """whether to let parallel environments reset upon termination instead of truncation"""
     eval_partial_reset: bool = False
@@ -186,7 +189,9 @@ def evaluate(args, eval_envs, get_action_fn, logger, eval_output_dir, max_episod
     stage_flag_keys = ["is_itemB_on_itemC", "is_itemA_grasped", "is_itemA_on_itemB",
                        "in_bin_ge1", "in_bin_ge2", "in_bin_ge3",
                        # Tower / Rearrange sub-goals
-                       "base_placed", "medium_supported", "small_supported", "buffer_occupied"]
+                       "base_placed", "medium_supported", "small_supported", "buffer_occupied",
+                       # Unstack3 sub-goals
+                       "is_itemA_on_table", "is_itemB_on_table"]
     stage_once = {}
     # Envs that split their dense reward into info['rew_<term>'] (e.g. TrayPack): sum each term over
     # the episode (mean over eval envs, raw units) so the eval return can be broken down by term.
@@ -696,6 +701,27 @@ if __name__ == "__main__":
     else:
         print("Running evaluation")
     logger = Logger(log_wandb=(args.track and not args.evaluate))
+    # Logger only talks to wandb; also append every logged dict to runs/<run>/metrics.jsonl (same format as
+    # train_squint_qc.py) and refresh examples/plot_metrics.py plots in the background after each eval.
+    import json as _json, subprocess as _sp, sys as _sys
+    _run_dir = os.path.dirname(model_path)
+    os.makedirs(_run_dir, exist_ok=True)
+    _wandb_log, _plot = logger.log, {"proc": None}
+
+    def _log_with_file(d, step):
+        row = {"step": int(step)}
+        row.update({k: (v.item() if torch.is_tensor(v) else v) for k, v in d.items()
+                    if torch.is_tensor(v) or isinstance(v, (int, float))})
+        with open(os.path.join(_run_dir, "metrics.jsonl"), "a") as fh:
+            fh.write(_json.dumps(row) + "\n")
+        _wandb_log(d, step)
+        if any(k.startswith("eval/") for k in d) and (_plot["proc"] is None or _plot["proc"].poll() is not None):
+            os.makedirs(os.path.join(_run_dir, "plots"), exist_ok=True)
+            with open(os.path.join(_run_dir, "plots", "plot.log"), "a") as plog:
+                _plot["proc"] = _sp.Popen([_sys.executable, "-m", "examples.plot_metrics", _run_dir, "--quiet"],
+                                          stdout=plog, stderr=plog, cwd=os.path.dirname(os.path.abspath(__file__)))
+
+    logger.log = _log_with_file
 
     # ── Instantiate modules ────────────────────────────────────────────────
 

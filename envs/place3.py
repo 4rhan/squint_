@@ -44,7 +44,8 @@ class Place3(DefaultCameraEnv):
     they can be moved in any order.
 
     **Randomizations:**
-    - the three cubes and the bin have random xy positions on the table (non-overlapping)
+    - the three cubes and the bin have random xy positions on the table (non-overlapping), all within the
+      arm's reach (cube_reach / bin_reach: distance from the robot base)
     - the cubes' and the bin's z-axis rotation is randomized
     - cube sizes and bin sizes are randomized within configured ranges
 
@@ -68,8 +69,10 @@ class Place3(DefaultCameraEnv):
             Place3RandomizationConfig, dict
         ] = Place3RandomizationConfig(),
         domain_randomization=False,
-        spawn_box_pos=[0.3, 0],
+        spawn_box_pos=[0.25, 0],
         spawn_box_half_size=0.2 / 2,
+        cube_reach=(0.16, 0.32),
+        bin_reach=(0.16, 0.27),
         **kwargs,
     ):
         # Robot-specific configuration
@@ -95,6 +98,12 @@ class Place3(DefaultCameraEnv):
 
         self.spawn_box_pos = spawn_box_pos
         self.spawn_box_half_size = spawn_box_half_size
+        # Distance from the robot base (m) that cube centres / the bin centre may have. The spawn box reaches 0.41 m,
+        # but a top-down SO101 grasp only reaches ~0.33 m: without this, ~60% of layouts had a cube out of reach
+        # (the scripted solver rejected them, and no policy could solve them). The bin's far slots sit ~4 cm
+        # beyond its centre, hence the smaller bin limit.
+        self.cube_reach = tuple(cube_reach)
+        self.bin_reach = tuple(bin_reach)
 
         super().__init__(
             *args,
@@ -263,21 +272,28 @@ class Place3(DefaultCameraEnv):
         cube_r = self.domain_randomization_config.cube_half_size_range[1] * np.sqrt(2)  # cube circumradius
         margin = 0.01
         n_cand = 512
+        batch = torch.arange(b, device=self.device)
+        offset = torch.tensor(self.spawn_box_pos[:2], device=self.device, dtype=torch.float32)  # spawn centre - base
 
-        bin_xy = (torch.rand(b, 2, device=self.device) * 2 - 1) * half
+        def in_reach(cand, lim):
+            r = torch.linalg.norm(cand + offset, dim=-1)
+            return (r >= lim[0]) & (r <= lim[1])
+
+        cand = (torch.rand(b, n_cand, 2, device=self.device) * 2 - 1) * half
+        bin_xy = cand[batch, in_reach(cand, self.bin_reach).float().argmax(dim=1)]
         bin_yaw = torch.rand(b, device=self.device) * 2 * np.pi
         hx = self.bin_half_sizes_x[env_idx][:, None]
         hy = self.bin_half_sizes_y[env_idx][:, None]
         cos, sin = torch.cos(bin_yaw)[:, None], torch.sin(bin_yaw)[:, None]
 
         cube_xy = torch.zeros(b, NUM_CUBES, 2, device=self.device)
-        batch = torch.arange(b, device=self.device)
         for j in range(NUM_CUBES):
             cand = (torch.rand(b, n_cand, 2, device=self.device) * 2 - 1) * half
             rel = cand - bin_xy[:, None, :]
             x_b = cos * rel[..., 0] + sin * rel[..., 1]
             y_b = -sin * rel[..., 0] + cos * rel[..., 1]
             ok = (x_b.abs() > hx + cube_r + margin) | (y_b.abs() > hy + cube_r + margin)
+            ok &= in_reach(cand, self.cube_reach)
             for k in range(j):
                 dist = torch.linalg.norm(cand - cube_xy[:, k, None, :], dim=-1)
                 ok &= dist > 2 * cube_r + margin

@@ -1,4 +1,5 @@
 import numpy as np
+from mani_skill.utils import gym_utils
 
 from examples.motionplanning.so101.motionplanner import SO101GraspSolver
 
@@ -6,6 +7,8 @@ MIN_APPROACH_PATH = 5  # waypoints (1 cm apart) of clear vertical approach requi
 WALL_INNER = 0.0025  # the bin's walls are centred on its outer half-size, 5 mm thick
 FINAL_RETREAT = 0.06  # after the last cube, back off high enough to be clear of the bin
 RELEASE_ABOVE_WALL = 0.004  # cube bottom this far above the wall top when it is let go
+
+LAST_FAIL = {}  # stage/reason of the last failed solve, read by examples/collect_new_tasks_demos.py
 
 
 def bin_slots(e, bin_x, bin_y, base_xy, half):
@@ -54,9 +57,14 @@ def _blocked_points(e, cube_k, d, others, bin_hx, bin_hy):
     return int(blocked.sum())
 
 
+FREE = "free"  # choose_jaw_dir result: no face direction works, let the IK pick the jaw yaw (jaw_dir=None)
+
+
 def choose_jaw_dir(solver, e, k, remaining, bin_hx, bin_hy):
     """Pick the jaw direction (one of the cube's four face directions) whose footprint is free of the bin and
-    the other cubes and that the arm can reach. Returns the unit direction, or None if the grasp is infeasible."""
+    the other cubes and that the arm can reach. Near the edge of the workspace no face-aligned yaw may be
+    reachable while the arm's own (misaligned) grasp is: then FREE, if nothing is near that grasp's jaws.
+    Returns the unit direction, FREE, or None if the grasp is infeasible."""
     cube, half = e.cubes[k], e.cube_half_sizes[0, k].item()
     a, b = solver.horizontal_axes(cube)
     natural = solver.natural_jaw_dir(cube, half)
@@ -67,6 +75,10 @@ def choose_jaw_dir(solver, e, k, remaining, bin_hx, bin_hy):
     for _, _, _, d in sorted(cands, key=lambda t: t[:3]):
         if solver.grasp_feasible(cube, half, jaw_dir=d, min_path=MIN_APPROACH_PATH):
             return d
+    if natural is not None and solver.grasp_feasible(cube, half, jaw_dir=None, min_path=MIN_APPROACH_PATH):
+        others = [j for j in remaining if j != k]
+        if _blocked_points(e, k, natural[:2], others, bin_hx, bin_hy) == 0:
+            return FREE
     return None
 
 
@@ -77,6 +89,7 @@ def solve(env, seed=None, debug=False, vis=False):
     arm's reach are rejected before anything moves, and each grasp uses a jaw direction that does not hit the
     bin walls or the other cubes."""
     env.reset(seed=seed)
+    LAST_FAIL.clear()
     solver = SO101GraspSolver(env, vis=vis)
     e = env.unwrapped
 
@@ -88,6 +101,7 @@ def solve(env, seed=None, debug=False, vis=False):
     # every cube must be graspable before we start (cheap, no simulation)
     everything = [0, 1, 2]
     if any(choose_jaw_dir(solver, e, k, everything, hx, hy) is None for k in everything):
+        LAST_FAIL.update(stage="precheck", reason="cube_not_graspable")
         return -1
 
     base = e.agent.robot.pose.sp.p
@@ -99,11 +113,26 @@ def solve(env, seed=None, debug=False, vis=False):
     # wall and the cube (they don't, in the smaller randomised bins); it drops the last centimetres.
     wall_top = bin_pose.p[2] + 2 * e.bin_half_sizes_z[0].item()
 
+    # a demo longer than the episode limit is discarded anyway: stop as soon as it can't fit, not at the end
+    horizon = gym_utils.find_max_episode_steps_value(env)
+
+    def over_budget(stage):
+        if horizon is not None and solver.n_steps > horizon:
+            LAST_FAIL.update(stage=stage, reason="over_horizon")
+            return True
+        return False
+
     remaining = list(order)
     for n, (slot, k) in enumerate(zip(slots, order)):
         cube, half = e.cubes[k], e.cube_half_sizes[0, k].item()
         d = choose_jaw_dir(solver, e, k, remaining, hx, hy)
-        if d is None or not solver.pick(cube, half, jaw_dir=d):
+        if d is None:
+            LAST_FAIL.update(stage=f"pick_{n}", reason="no_jaw_dir")
+            return -1
+        if not solver.pick(cube, half, jaw_dir=None if d is FREE else d):
+            LAST_FAIL.update(stage=f"pick_{n}", reason=solver.fail_reason)
+            return -1
+        if over_budget(f"pick_{n}"):
             return -1
         remaining.remove(k)
         target = slot.copy()
@@ -112,5 +141,8 @@ def solve(env, seed=None, debug=False, vis=False):
         last = n == 2
         if not solver.place(cube, target, (bin_x, bin_y), jaw_perp=long_ax, release_gap=0.012, release_height=release_h,
                             retreat_height=FINAL_RETREAT if last else None):
+            LAST_FAIL.update(stage=f"place_{n}", reason=solver.fail_reason)
+            return -1
+        if over_budget(f"place_{n}"):
             return -1
     return solver.hold(6)

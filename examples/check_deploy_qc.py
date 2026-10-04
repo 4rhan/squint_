@@ -63,11 +63,16 @@ def main(args: Args):
         import imageio
         os.makedirs(args.video_dir, exist_ok=True)
 
+    # per-task stage flags reported as "reached at any step of the episode" (only those the env provides)
+    stage_keys = ["is_item_grasped", "item_lifted",                                   # Lift
+                  "itemA_picked_clean", "is_itemA_on_table", "itemB_picked_clean",   # Unstack3
+                  "is_itemB_on_table", "tower_knocked"]
     results = []
     for ep in range(args.episodes):
         obs, _ = env.reset(seed=args.seed + ep)
         agent.reset()
         frames, success_once, first_success = [], False, None
+        stages = {}
         for t in range(args.max_episode_steps):
             action = agent.get_action({k: v.to(device) for k, v in obs.items()}).cpu().numpy()
             action = np.clip(action * args.action_scale, -1, 1)  # deploy.py
@@ -75,27 +80,29 @@ def main(args: Args):
             ok = bool(info["success"].reshape(-1)[0])
             if ok and not success_once:
                 success_once, first_success = True, t + 1
+            for k in stage_keys:
+                if k in info:
+                    stages[k] = stages.get(k, False) or bool(info[k].reshape(-1)[0])
             if args.video_dir:
                 scene = env.render()[0].cpu().numpy()
                 # the wrist image the policy sees (before its 16 px downsample), scaled to the scene height
                 wrist = cv2.resize(obs["rgb"][0].cpu().numpy(), (scene.shape[0], scene.shape[0]),
                                    interpolation=cv2.INTER_NEAREST)
                 frames.append(np.concatenate([scene, wrist], axis=1))
-        grasped = bool(info["is_item_grasped"].reshape(-1)[0])
-        lifted = bool(info.get("item_lifted", info["success"]).reshape(-1)[0])
-        results.append((ok, success_once, first_success, grasped, lifted))
+        results.append((ok, success_once, first_success, stages))
         print(f"episode {ep:2d} (seed {args.seed + ep}): success at end {ok!s:5}  once {success_once!s:5}  "
-              f"first success step {first_success}  grasped {grasped!s:5}  lifted {lifted}")
+              f"first success step {first_success}  " + "  ".join(f"{k} {int(v)}" for k, v in stages.items()))
         if args.video_dir:
             imageio.mimsave(f"{args.video_dir}/episode_{ep}.mp4", frames, fps=10)
 
-    r = np.array([[x[0], x[1], x[3], x[4]] for x in results], dtype=float)
+    r = np.array([[x[0], x[1]] for x in results], dtype=float)
     steps = [x[2] for x in results if x[2] is not None]
     print(f"\n{args.episodes} episodes, action_scale {args.action_scale}, exec_steps {agent.exec_steps}, "
           f"{args.max_episode_steps} steps, DR {args.domain_randomization}:")
     print(f"  success at end {r[:, 0].mean():.2f}  success once {r[:, 1].mean():.2f}  "
-          f"grasped at end {r[:, 2].mean():.2f}  lifted at end {r[:, 3].mean():.2f}  "
           f"first success step mean {np.mean(steps) if steps else float('nan'):.1f}")
+    print("  reached during the episode: " + "  ".join(
+        f"{k} {np.mean([x[3].get(k, False) for x in results]):.2f}" for k in results[0][3]))
     env.close()
 
 

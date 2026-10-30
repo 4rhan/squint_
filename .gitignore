@@ -100,3 +100,9 @@ Thumbs.db
 
 # Old-format scripted-demo trials (absolute joint targets, no observations); QC demos live in demos/qc/
 demos/*/motionplanning/
+
+# Local-only: paper drafts, scratch outputs, tool dumps
+paper/
+validation/
+*.docx
+repomix-output.xml

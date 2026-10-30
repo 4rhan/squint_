@@ -189,7 +189,8 @@ sunlight; good motor calibration and camera alignment matter most for transfer.
 │   ├── base_random_env.py    # shared cameras, domain randomization, background overlay
 │   ├── reach.py lift.py place.py stack.py                   # original Squint tasks
 │   ├── stack3.py place3.py tower.py tray_pack.py rearrange.py unstack3.py   # multi-stage tasks
-│   └── robot/                # SO-101 / SO-100 model, controllers, grasp checks
+│   ├── robot/                # SO-101 / SO-100 model, controllers, grasp checks
+│   └── docs/                 # upstream Squint project website
 ├── examples/
 │   ├── motionplanning/so101/ # scripted solver (motionplanner.py, collision.py) + one solution per task
 │   ├── collect_new_tasks_demos.py   # main demo collector (parallel, recovery noise)
@@ -203,9 +204,7 @@ sunlight; good motor calibration and camera alignment matter most for transfer.
 │   ├── view_task.py/.sh      # watch the solver (live or mp4)
 │   ├── check_wrist_visibility.py, visualize_sim.py, viser_eval.py   # visual checks / viewers
 ├── deploy_utils/             # real-robot interface, robot config, camera tuning, 3D-print files
-├── results/                  # upstream Squint training curves
-├── validation/               # wrist-camera snapshots from the Sep 26 task validation
-└── docs/                     # upstream Squint project website
+└── results/                  # upstream Squint training curves
 ```
 
 ## Documentation
@@ -216,7 +215,6 @@ sunlight; good motor calibration and camera alignment matter most for transfer.
 | [`QC_EXPERIMENT_LOG.md`](QC_EXPERIMENT_LOG.md) | every experiment: settings, results, analysis, decisions |
 | [`DEMOS.md`](DEMOS.md) | demo collection and the HDF5 format |
 | [`TASK_SPEC.md`](TASK_SPEC.md) | specification of Tower, TrayPack and Rearrange |
-| [`VALIDATION.md`](VALIDATION.md) | what was verified for those tasks (Sep 26 snapshot) |
 
 ## Acknowledgments and citation
 

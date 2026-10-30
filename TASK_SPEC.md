@@ -145,5 +145,5 @@ registration + wrappers): `obs_mode="rgb+segmentation"`,
 Gripper clearance on largest cubes/compartments/pockets, tower stability on real
 friction, printed tray/pocket tolerances and colors, marker print size/colors,
 wrist-camera FOV/pose match (`tune_camera.py`), lighting/black-overlay match,
-motor calibration, table height. See VALIDATION.md blockers. Do not present sim
+motor calibration, table height. Do not present sim
 feasibility as hardware performance.

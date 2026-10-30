@@ -1,8 +1,8 @@
 # Squint + Q-Chunking: long-horizon SO-101 manipulation
 
 This repo extends [**Squint**](https://aalmuzairee.github.io/squint) (fast visual RL for sim-to-real on the SO-101 arm)
-to **multi-stage tasks** (stacking, unstacking, packing, rearranging several cubes), which plain RL from scratch does
-not solve. The recipe:
+to **multi-stage tasks** (stacking, unstacking, packing, rearranging several cubes). Plain RL from scratch does not
+solve these tasks. The recipe:
 
 1. **Scripted demonstrations.** A motion-planning solver performs each task in simulation and records demos in exactly
    the observation/action format the policy trains with.
@@ -16,7 +16,7 @@ envs/ (tasks)  ──►  scripted solver  ──►  demos (.h5)  ──►  tr
                     examples/motionplanning   verify_demos      offline → online RL
 ```
 
-## Results so far
+## Results
 
 Success = all objects placed and the robot at rest at the end of the episode, measured in eval episodes on a fixed
 seed. Full details of every run are in [`QC_EXPERIMENT_LOG.md`](QC_EXPERIMENT_LOG.md).
@@ -30,7 +30,7 @@ seed. Full details of every run are in [`QC_EXPERIMENT_LOG.md`](QC_EXPERIMENT_LO
 | `SO101StackCube-v1` | ≤ 0.06 | `stack_fast500` | learns to grasp (0.94) but not to stack |
 | `SO101Tower3Cube-v1` | 0 | `tower3_500` | never learned to grasp; cause not found |
 
-What has made the difference so far:
+What made the difference:
 - **Recovery demos** (noisy actions + deliberate missed grasps, so the demos show corrections): TrayPack3 ≥1 cube
   went from 0.19 to 0.88.
 - **`--q_agg min`** (pessimistic critic target): stopped the critic overestimating and the late collapse on Unstack3
@@ -49,7 +49,8 @@ conda activate squint
 
 ## Quick start (Unstack3)
 
-Run everything from the repo root. On a remote box, run long jobs inside `tmux`.
+Run everything from the repo root. On a remote box, run long jobs inside `tmux`. Demo datasets are not stored in
+the repo; the scripts below generate them with the scripted solver (a few minutes per task).
 
 **1. Watch the scripted solver do the task**
 ```bash
@@ -149,9 +150,13 @@ python train_squint.py --env_id=SO101LiftCube-v1 --track --wandb_entity=YOUR_WAN
 
 ## Deployment on the real SO-101
 
-> `deploy.py` on this branch runs **Squint SAC checkpoints** (`train_squint.py`). Deploying **QC-FQL checkpoints**
-> (`deploy_qc.py`, `examples/check_deploy_qc.py`) is on the `feat/deployment` branch. Use `--qc_exec_steps 1`
-> (replan every step) when scaling actions down on the real arm.
+- `deploy.py` runs **Squint SAC checkpoints** (`train_squint.py`).
+- `deploy_qc.py` runs **QC-FQL checkpoints** (`train_squint_qc.py`). It takes the same flags as `deploy.py`, plus
+  `--qc_exec_steps` (actions played from each chunk before replanning; use 1 when scaling actions down on the real
+  arm) and `--wrist_roll_offset_deg` (our arm's wrist roll is mounted 90° off the sim; set 0 if yours isn't).
+- Before using the arm, run the checkpoint through the same deployment path in sim:
+  `python -m examples.check_deploy_qc --checkpoint runs/<run>/ckpt_best.pt`.
+- `examples/run_unstack3_deploy.sh` trains an Unstack3 policy with domain randomization for real-robot use.
 
 **Prerequisites:** a working SO-101 arm, a mounted wrist camera, and motors calibrated with
 [LeRobot calibration](https://huggingface.co/docs/lerobot/en/so101).
@@ -169,6 +174,7 @@ python train_squint.py --env_id=SO101LiftCube-v1 --track --wandb_entity=YOUR_WAN
    ```bash
    python deploy.py --checkpoint=path/to/ckpt.pt --env_id=SO101LiftCube-v1
    python deploy.py --checkpoint=wandb --env_id=SO101LiftCube-v1 --wandb_entity=YOUR_WANDB_USERNAME
+   python deploy_qc.py --checkpoint=runs/<run>/ckpt_best.pt --env_id=SO101LiftCube-v1 --debug   # QC-FQL
    ```
    Keys: `s` skips the episode, `q` quits.
 
@@ -184,6 +190,7 @@ sunlight; good motor calibration and camera alignment matter most for transfer.
 ├── train_squint.py           # original Squint SAC trainer (also provides Args, Logger, evaluate)
 ├── utils.py                  # env wrappers: image downsampling, colour jitter
 ├── deploy.py                 # real-robot deployment (Squint SAC checkpoints)
+├── deploy_qc.py              # real-robot deployment (QC-FQL checkpoints)
 ├── environment.yaml          # conda environment
 ├── envs/                     # ManiSkill tasks (see the task table)
 │   ├── base_random_env.py    # shared cameras, domain randomization, background overlay
@@ -200,9 +207,10 @@ sunlight; good motor calibration and camera alignment matter most for transfer.
 │   ├── relabel_demo_rewards.py              # recompute demo rewards after a reward change
 │   ├── collect_tp3_recovery.sh              # generic collect → verify → train pipeline (used by the run scripts)
 │   ├── run_unstack3_qc.sh, run_two_task_qc.sh   # experiment scripts
+│   ├── run_unstack3_deploy.sh, check_deploy_qc.py  # real-robot policy training + sim check of the deploy path
 │   ├── plot_metrics.py       # matplotlib plots from runs/<run>/metrics.jsonl
 │   ├── view_task.py/.sh      # watch the solver (live or mp4)
-│   ├── check_wrist_visibility.py, visualize_sim.py, viser_eval.py   # visual checks / viewers
+│   └── check_wrist_visibility.py, visualize_sim.py, viser_eval.py   # visual checks / viewers
 ├── deploy_utils/             # real-robot interface, robot config, camera tuning, 3D-print files
 └── results/                  # upstream Squint training curves
 ```
@@ -212,9 +220,27 @@ sunlight; good motor calibration and camera alignment matter most for transfer.
 | File | Contents |
 |---|---|
 | [`QC_README.md`](QC_README.md) | how the QC-FQL agent works: losses, chunk sampling, demo format |
+| [`HYPERPARAMETERS.md`](HYPERPARAMETERS.md) | every training hyperparameter: recommended settings vs code defaults |
 | [`QC_EXPERIMENT_LOG.md`](QC_EXPERIMENT_LOG.md) | every experiment: settings, results, analysis, decisions |
 | [`DEMOS.md`](DEMOS.md) | demo collection and the HDF5 format |
 | [`TASK_SPEC.md`](TASK_SPEC.md) | specification of Tower, TrayPack and Rearrange |
+| [`MANIBENCH_TASKS.md`](MANIBENCH_TASKS.md) | task card for the long-horizon tasks |
+
+## Branches
+
+`master` has everything above. The other branches keep earlier lines of work:
+
+| Branch | Contents |
+|---|---|
+| `feat/deployment` | development branch for real-robot deployment (same as `master` at release) |
+| `feat/scripted-demos` | scripted solvers and demo collection for Lift / Stack / Stack3 / Place3 / Unstack3 |
+| `tasks-and-data-loaders` | Tower, TrayPack and Rearrange tasks and their solvers |
+| `feat/qc-flow-policy`, `feat/q_chunking` | first QC-FQL agent and Q-chunking implementation |
+| `feat/qc-efficiency` | faster solver profile, Tower reward v2, fixed-seed evals |
+| `feat/sim-real-cotrain` | intermediate snapshot while adding the Unstack3 task |
+| `asymmetric` | asymmetric actor-critic with privileged simulator state (see `ASYMMETRIC.md` there) |
+| `feat/franka_task`, `feat/new_task_addtion` | early plug-insertion, peg-insertion and tool-sweep tasks |
+| `feat/cube_small` | upstream Squint with a smaller repo and the website moved to `docs/` |
 
 ## Acknowledgments and citation
 
